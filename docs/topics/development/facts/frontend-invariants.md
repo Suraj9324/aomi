@@ -1,0 +1,228 @@
+---
+title: Frontend Compatibility Invariants
+owner: frontend
+status: authoritative
+area: development
+review_after_days: 30
+sources_of_truth:
+  - scripts/check-consumer-compatibility.mjs
+  - scripts/check-consumer-compatibility-baseline.mjs
+  - tests/contracts/consumer-baseline.json
+  - scripts/check-frontend-boundaries.mjs
+  - scripts/test-browser-contracts.mjs
+  - scripts/test-packed-consumers.mjs
+  - scripts/browser-hosts.mjs
+  - .github/scripts/select-ci-paths.mjs
+  - .github/workflows/ci.yml
+  - .github/CODEOWNERS
+  - examples/embed-vite/package.json
+  - examples/headless/package.json
+  - packages/widget/src/host-composition.ts
+  - apps/portal/src/components/shell/portal-aomi-frame.tsx
+---
+
+# Frontend Compatibility Invariants
+
+Existing integrations must keep working when their installed Aomi packages
+change. Implementation can change freely while these contracts hold.
+Frontend owners: @CeciliaZ030 and @arixoneth.
+
+| Rule         | Contract                                                                                                                  | Enforcement                                                                |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| SDK-01       | Existing headless consumer imports and calls still compile against the shipped client package.                            | Packed-package consumer check.                                             |
+| WIDGET-01    | Existing `<AomiWidget>` integrations work without new mandatory host providers or setup calls.                            | Trusted-base packed widget consumer build.                                 |
+| SHARED-UI-01 | Reusable chat, account, settings, usage, and Library UI has one implementation in `packages/widget`.                      | Portal imports the explicit `host-composition` package entrypoint.         |
+| HOST-01      | Portal may compose `AomiFrame`; it need not render public `AomiWidget` or copy its host policy.                           | Portal frame tests plus dependency-boundary check.                         |
+| DIRECTION-01 | Portal cannot import private widget source; widget cannot import Portal; packages cannot depend on app UI.                | `check:frontend-boundaries` in the required packages job.                  |
+| AUTH-01      | Public credentials terminate at the BFF; internal backend assertions are server-minted and fail closed.                   | Production Portal browser contracts verify signed assertions and headers.  |
+| AUTH-02      | EVM/SVM sign-in and wallet linking resolve one canonical account; rejected, replayed, or wrong-origin proofs fail closed. | Production wallet-provider browser contracts against disposable Postgres.  |
+| GUEST-01     | Portal may recover cookie-owned guest history; anonymous cross-origin widgets do not persist it by default.               | Portal guest test plus packaged cross-origin browser contracts.            |
+| CONSUMER-01  | A PR cannot hide a break by rewriting its consumers.                                                                      | Extract consumers from the owner-reviewed release pin, never the working tree. |
+| INSTALL-01   | Published packages install without undeclared workspace or hoisted dependencies; public entries and the SDK CLI load.     | Synthetic isolated clean install from candidate tarballs.                  |
+| VISUAL-01    | Chat, account, settings, usage, and wallet-review surfaces keep their reviewed production layout.                         | Deterministic production-build Playwright image contracts.                 |
+| ACTION-01    | Wallet Actions require an explicit choice and remain durable, idempotent, and fail closed across errors and reloads.      | Controlled-upstream browser Action lifecycle contract.                     |
+| TEST-01      | Compatibility failures, omitted browser scenarios, or missing prerequisites block merging.                                | Required `Frontend CI Passed` aggregate checks all dependency jobs.        |
+| OWNER-01     | Consumer, boundary, harness, and CI protection changes require frontend-owner review.                                     | CODEOWNERS plus GitHub required code-owner approval.                       |
+
+## Shared UI and host policy
+
+Widget and Portal action buttons use `AomiButton`. For links and slotted triggers inside the widget, use `aomiButton`. Primary actions use deep blue, secondary actions use a neutral fill, and destructive actions use `danger` for entry and `danger-fill` for confirmation. Action buttons have an 8 px radius.
+
+Dropdowns use the shared `PopoverContent` surface or `aomi-menu-panel` for inline pickers. Use `aomi-menu-row` for neutral hover and `aomi-wallet-choice` for default-wallet triggers and choices. Wallet choices show a blue selection check and a keyboard focus outline.
+
+Widget interface icons use Phosphor Regular from `@/icons/ui-icons`. To add a glyph, find its name in the [Phosphor catalog](https://phosphoricons.com/) and re-export its individual React icon module in that file. Use the catalog for UI symbols and the existing brand maps for wallet, chain, and provider identities. Icon-only actions use `aomi-icon-trigger` with an accessible name and the shared tooltip. Explanatory question marks use `HelpHint`, which supports tap, hover, and keyboard focus.
+
+Widget navigation tabs and single-choice filter rows use `NavigationTab` from `@/ui/aomi/navigation-tab` with a 4px gap between items. It shares hover and selected colors with sidebar threads.
+
+Widget segmented controls use `Segmented` from `@/ui/aomi/segmented`. Pass the group label, options, value, and change handler. The component owns sizing, selection styling, and keyboard navigation.
+
+`@aomi-labs/widget/host-composition` is the intentional contract for
+first-party hosts that assemble `AomiFrame`. Keep the entrypoint curated: add a
+shared export because a host needs the shared implementation, not as a shortcut
+around package ownership. Portal-local routes, BFF handlers, URL handoffs,
+session integration, transport selection, and persistence policy stay in
+`apps/portal`.
+
+The public `AomiWidget` owns its wallet providers, widget authentication, and
+cross-origin transport. `PortalAomiFrame` owns first-party composition and its
+cookie-aware guest policy. Both consume the same reusable UI without forcing
+these legitimate host differences into one component.
+
+Do not add Portal forwarding files, relative imports into
+`packages/widget/src`, or Portal imports through the widget's internal
+`@/components`, `@/hooks`, and `@/lib` aliases. Those aliases exist only so the
+widget source graph can compile inside the Portal workspace.
+
+## Authentication and transport
+
+First-party cookies, origin-bound widget sessions, OAuth access tokens, opaque
+Better Auth session bearers, and server-minted internal assertions are distinct
+credentials. Browser code must not import service assertion signing. The BFF
+validates the caller and requested resource/scope, allowlists forwarded headers,
+strips incoming authorization and cookies before the backend hop, and mints the
+internal assertion server-side. An invalid explicit credential must not fall
+back to a weaker identity.
+
+## Packaged compatibility
+
+The supported widget package is `@aomi-labs/widget`. The owner-authorized
+package-name cutover retires `@aomi-labs/widget-lib`, including its implicit
+provider SDK dependencies. Fresh-install checks target the current package;
+trusted-base consumer sources remain unchanged. Existing npm releases are not
+unpublished.
+
+Run `pnpm run test:contracts` from the checkout. The default Git revision is pinned
+in `tests/contracts/consumer-baseline.json`; `--base <full-commit-sha>` is an explicit
+local override.
+The check builds candidate packages, packs them, and installs them into temporary
+consumer directories outside the monorepo. The original source and build scripts
+come from the trusted base. Workspace dependency references are replaced with
+candidate tarballs and source aliases are removed so unpublished source cannot
+make a broken package pass. The immutable widget fixture retains two
+dependencies previously supplied by the monorepo so the historical consumer is
+reproduced exactly. A separate isolated clean-install fixture starts from only the
+public widget plus React, resolves the complete candidate package stack from
+tarballs, loads the widget, React runtime, client, and deploy lifecycle entries,
+and executes the packed SDK CLI. Third-party peer-range warnings remain visible
+but do not mask whether Aomi's own files and exports work. The headless tests and
+SDK ESM/CJS imports also run against the installed package. No login credentials
+or running backend are needed.
+
+CI and browser checks use the same owner-reviewed release pin. A missing, invalid
+or unavailable pinned commit fails instead of falling back to candidate consumers.
+
+## Conditional CI selection
+
+The required `Frontend CI Passed` check always runs, but expensive dependency
+jobs run only when their owned paths or a shared dependency changed. Portal and
+Build changes select their preview smoke; Portal and widget/auth changes select
+the relevant browser contracts; publishable package changes select packed
+consumer compatibility. Plain documentation and historical work-log changes do
+not run product builds. Landing content under `apps/landing/content` is product
+input and still selects Landing.
+
+The advisory PR smoke checks Cloudflare staging Chat and the immutable Build
+preview for the PR SHA. The required Portal browser contracts exercise the PR's
+Portal build. The nightly fallback smoke checks both canonical staging hosts.
+Production Chat's page Worker rolls back through the product-mono Edge release
+workflow. The frontend Vercel rollback covers Build, Base and Landing.
+
+Lockfiles, root build configuration, shared source, selector changes, unknown
+paths, unavailable comparisons, and every production candidate default to the
+full check set. The aggregate requires selected jobs to succeed and unselected
+jobs to be explicitly skipped, so a selector failure or unexpected skip cannot
+produce a green required check. Keep path-selection cases in
+`tests/contracts/ci-path-selection.test.mjs` whenever ownership changes.
+
+Main CI runs the widget package contracts as a reusable job for selected
+changes, including package release notes and API reports. A package tag can
+publish only if that job succeeded on the exact tagged commit's main CI run.
+
+## Production browser contracts
+
+Run `pnpm run test:browser:contracts` with
+`AOMI_TEST_DATABASE_URL` pointing at a disposable Postgres database and
+`AOMI_TEST_DATABASE_DISPOSABLE=1` to exercise a production Portal build and an
+immutable trusted-base Vite consumer installed against candidate package
+tarballs. The harness applies the canonical account-schema fixture and current
+Better Auth migrations, uses deterministic throwaway EVM/SVM keys, and starts
+the fake upstream in `tests/e2e/fake-backend/upstream.ts`, which verifies the
+Portal's internal BFF JWT. It fails if any mandatory Playwright case is
+missing, skipped, flaky, or unexpected. `pnpm run test:browser:consumers` uses
+the same hosts plus a packed Next.js consumer to run the journeys and the
+ordinary-turn performance gate on all four hosts.
+CI runs the journeys once, in the Packed Consumers job, which also
+typechecks `tsconfig.journeys.json`; there is no separate dev-build journeys job.
+
+The Portal cases cover EVM and SIWS sign-in, reload persistence, explicit wallet
+linking, signature rejection, sign-out/account switching, canonical identity,
+history isolation, completed chat, the allowlisted BFF hop, deterministic visual
+baselines, and a durable wallet Action through local handoff failure, rejection,
+idempotent replay, stale-result rejection, and reload. The packaged
+widget cases cover real preflight/CORS behavior, guest nonpersistence, invalid
+explicit WST fail-closed behavior, readable origin rejection, session renewal,
+wallet-authenticated persistence, nonce replay/origin binding, canonical account
+resolution, completed turns, and selected upstream error headers.
+
+Before editing, identify affected rules. Before finishing, report the baseline,
+checks run, public contract changes, and remaining coverage limits. To add a
+feature, preserve the existing supported integration. Deliberate breaking
+migrations need a separate owner-reviewed compatibility/release decision; do
+not weaken this check to pass an ordinary refactor.
+
+CODEOWNERS alone does not enforce review: `main` must require code-owner approval
+and `Frontend CI Passed` in GitHub branch protection. Keep stale approval
+dismissal enabled. The baseline and enforcement files are themselves owned.
+
+These checks establish package and consumer compatibility for the exercised
+examples and prove the listed cross-origin browser-to-BFF journeys. Browser
+wallets are standards-compatible injected fixtures with ephemeral keys, not
+real extension or embedded-provider accounts. The controlled upstream validates
+identity and protocol transport but does not replace a hosted backend smoke.
+The suite never signs transactions or broadcasts. It is not a real-provider-
+availability or full backend-migration test; the hosted browser
+journeys in aomi-qa's release test run (product-mono `release-test.yml`) are
+the real-provider and backend check, on rc for every release.
+
+## Payment cutover consumer baseline
+
+The `payments-v2` consumer is Git commit
+`d27f488b0cc4b7cb21929475c347ededf6c22127`, tagged
+`consumer-baseline/payments-v2`. Its headless payment example uses `CreditBalance`,
+separate `credits.ledger()` reads and durable `beginFunding()` calls. The commit
+updates only the example, its README and its environment template. The test copies
+these committed sources unchanged and compiles them against the candidate packages.
+There is no compiler-error exception, fixture rewriting or runtime legacy adapter.
+
+Changing this release pin requires frontend-owner review, including for a cutover.
+Publish the tag with the release (`git push origin refs/tags/consumer-baseline/payments-v2`)
+before running remote CI against the new pin. CI fetches full history and tags;
+it cannot use an unpublished local Git object. Keep the tag immutable. A future
+breaking cutover creates a new reviewed consumer commit and advances the pin.
+
+## TypeScript reform clean cutover
+
+The TypeScript reform release (#806) removes compatibility layers on purpose.
+The `ts-reform-clean-cutover-v2` baseline freezes the updated headless and
+Vite consumers at commit `09cb7adaf36946f80e0cc7849e5965712e8ba8da`, tagged
+`consumer-baseline/ts-reform-clean-cutover-v2`. This replaces the payments-v2 pin
+for this intentional breaking release. Candidate checks still copy immutable
+consumer sources unchanged; no fixture rewriting or compiler-error exceptions
+are introduced. Retired widget paths/props, the SDK wallet option, CLI aliases
+and old session files are outside this release's contract. Boundary, auth,
+account isolation and package-install checks remain required.
+
+Portal and Build share the interaction palette and layout scale in `@aomi-labs/widget/design-tokens.css`. Use G1 for neutral controls, labels and outlines, G2 for hover, G3 for secondary copy, B2 for navigation selection, and B3 with white ink for table group headers and summary footers. Segmented controls have a white selected segment. On-band actions use white with black ink. Primary actions use brand blue with white text and icons in both themes. Keep color literals in the shared palette. Use semantic theme aliases in feature code.
+
+Use level 1 for page titles and primary amounts (24px), level 2 for section titles (18px), level 3 for row labels (14px), and captions for supporting text (13px). Use the section stack and section body layouts for 24px between sections and 16px below headings. Rows have 12px vertical and 16px horizontal inset, with 4px between label and detail. Align inline amounts and qualifiers on their text baselines.
+
+| Role | Widget class or component |
+| --- | --- |
+| Page title or main amount / section / row / supporting copy | `type-title` / `type-section` / `type-row` / `type-meta` |
+| Sections / heading followed by content | `aomi-section-stack` / `aomi-section-body` |
+| G1 fill / outline, G2 hover, G3 secondary ink | `bg-aomi-surface-2` / `border-aomi-border`, `hover:bg-aomi-hover`, `text-aomi-muted` |
+| Selected navigation, segmented choices | `NavigationTab`, `Segmented` |
+| B3 table group / footer action | `aomi-table-band`, `AomiButton variant="on-band"` |
+| Neutral, primary and destructive actions | `AomiButton` with the corresponding variant |
+
+Build imports `NavigationTab`, `PillDropdown`, and `AomiButton` from `@aomi-labs/widget/controls`. Use `aomiButton` to give a link the same action styling. Operate cards and table frames share the 12px panel radius.

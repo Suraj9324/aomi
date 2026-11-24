@@ -1,0 +1,572 @@
+import type {
+  Action,
+  CommitController,
+  CommitView,
+  Event,
+} from "@aomi-labs/client";
+import {
+  isMessageReview,
+  normalizeSolanaCluster,
+  summarizeSimulation,
+} from "@aomi-labs/client";
+import { selectTaskRuns } from "@aomi-labs/react";
+import { messageChainId, unwrapToolStep } from "@aomi-labs/client/trace";
+import { svmTransactionLabel } from "./transaction-label";
+
+type RecordValue = Record<string, unknown>;
+export type ActivityTransaction = {
+  id: string;
+  sequence?: number;
+  turnId: string | null;
+  family: "evm" | "svm";
+  label: string;
+  kind: string;
+  chainId?: number;
+  cluster?: string;
+  raw: RecordValue;
+  stage: "staged" | "simulated" | "simulation-failed" | "committed";
+  action?: Action;
+  actionIndex?: number;
+  committedWire?: string;
+  commit?: CommitView;
+};
+
+/** Commits awaiting the wallet or the user's approval, in signing order:
+ * whole groups in the order they were committed, each by its own leg index.
+ * A later group (another chain, say) never cuts in while an earlier one still
+ * has legs to sign. An atomic group shows only its leader: the rest go with
+ * it. An approved commit is Aomi's to sign. */
+export function selectReviewQueue(
+  commits: readonly CommitView[],
+  controller: Pick<CommitController, "review" | "plan"> | undefined,
+): CommitView[] {
+  if (!controller) return [];
+  // A group arrives with its first commit: a batch, or a lone commit.
+  const group = (commit: CommitView) =>
+    commit.batch?.batch_id ?? commit.commit_id;
+  const arrival = new Map<string, number>();
+  commits.forEach((commit, index) => {
+    if (!arrival.has(group(commit))) arrival.set(group(commit), index);
+  });
+  const order = (commit: CommitView) => arrival.get(group(commit)) ?? 0;
+  return commits
+    .filter(
+      (commit) =>
+        !(commit.batch?.index && controller.plan?.(commit).atomic) &&
+        (commit.state === "awaiting_approval" ||
+          ((commit.state === "needs_signature" ||
+            commit.state === "awaiting_broadcast") &&
+            commit.approval?.state !== "approved")) &&
+        controller.review(commit.commit_id) !== undefined,
+    )
+    .sort(
+      (a, b) =>
+        order(a) - order(b) || (a.batch?.index ?? 0) - (b.batch?.index ?? 0),
+    );
+}
+
+export function selectReviewCommit(
+  commits: readonly CommitView[],
+  controller: Pick<CommitController, "review" | "plan"> | undefined,
+): CommitView | undefined {
+  return selectReviewQueue(commits, controller)[0];
+}
+
+function record(value: unknown): RecordValue | undefined {
+  if (typeof value === "string") {
+    try {
+      return record(JSON.parse(value));
+    } catch {
+      return undefined;
+    }
+  }
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as RecordValue)
+    : undefined;
+}
+const string = (value: unknown) =>
+  typeof value === "string" ? value : undefined;
+const number = (value: unknown) =>
+  typeof value === "number" ? value : undefined;
+const ids = (value: unknown): number[] =>
+  Array.isArray(value)
+    ? value.filter((id): id is number => typeof id === "number")
+    : [];
+/** The pending ids a staged record stands for: a Solana bundle lists its
+ * instructions' ids, every other record names one. */
+/** Staged rows and commits may spell a cluster differently. */
+const clusterRef = (value?: string) => normalizeSolanaCluster(value) ?? value;
+
+const stagedIds = (tx: RecordValue): number[] => {
+  if (Array.isArray(tx.pending_ix_ids)) return ids(tx.pending_ix_ids);
+  const id = number(tx.pending_tx_id) ?? number(tx.pending_ix_id);
+  return id == null ? [] : [id];
+};
+/** A direct svm_stage_ix call's instructions: one transaction to the user. */
+function instructionBundle(items: unknown[]): RecordValue | undefined {
+  const records = items
+    .map(record)
+    .filter((item): item is RecordValue => item != null);
+  if (!records.length) return undefined;
+  return {
+    ...records[0],
+    pending_ix_ids: records.flatMap(stagedIds),
+  };
+}
+
+/** Only complete tool records are projected; streamed child previews are not authoritative. */
+function toolRecord(
+  event: Event,
+): { name: string; result: RecordValue } | undefined {
+  let name: string, result: unknown;
+  if (event.type === "message" && event.tool_result) {
+    name = event.tool_name ?? event.tool_result[0];
+    result = record(event.tool_result[1]);
+  } else if (event.type === "tool_complete" || event.type === "tool_update") {
+    name = event.tool_name;
+    result = record(event.result);
+  } else return;
+  const unwrapped = unwrapToolStep({ toolName: name, result }).resultRecord;
+  return unwrapped ? { name, result: unwrapped } : undefined;
+}
+
+/** Changes this chat's agent filed with `rules_propose`, oldest first; the server says which still wait. */
+export function selectPolicyChangeIds(events: readonly Event[]): string[] {
+  const ids: string[] = [];
+  for (const event of events) {
+    const tool = toolRecord(event);
+    if (tool?.name !== "rules_propose") continue;
+    const id = string(record(tool.result.waiting_for_admin)?.id);
+    if (id && !ids.includes(id)) ids.push(id);
+  }
+  return ids;
+}
+
+/** The wallet of each `rules_propose`/`rules_tighten` filing in this chat, oldest first. */
+export function selectPolicyFilings(events: readonly Event[]): string[] {
+  const wallets: string[] = [];
+  for (const event of events) {
+    const tool = toolRecord(event);
+    if (tool?.name !== "rules_propose" && tool?.name !== "rules_tighten")
+      continue;
+    const id = string(tool.result.agent_wallet_id);
+    if (id) wallets.push(id);
+  }
+  return wallets;
+}
+
+function sameInstruction(raw: RecordValue, ix: RecordValue): boolean {
+  return (
+    Boolean(raw.program_id) &&
+    ix.program_id === raw.program_id &&
+    ix.data_base64 === raw.data_base64 &&
+    JSON.stringify(ix.accounts) === JSON.stringify(raw.accounts)
+  );
+}
+
+/** Match immutable transaction content, never labels or the ordinal in a batch. */
+function sameTransaction(
+  staged: ActivityTransaction,
+  action: Action,
+  index: number,
+): boolean {
+  const request = action.request;
+  if (request.type === "execute_evm" && staged.family === "evm") {
+    const tx = request.transactions[index];
+    const raw = staged.raw;
+    return (
+      tx.chain_id === raw.chain_id &&
+      tx.from.toLowerCase() === string(raw.from)?.toLowerCase() &&
+      tx.to.toLowerCase() === string(raw.to)?.toLowerCase() &&
+      tx.data.toLowerCase() === string(raw.data)?.toLowerCase() &&
+      (tx.value ?? "0") === (raw.value ?? "0")
+    );
+  }
+  if (request.type === "execute_svm" && staged.family === "svm") {
+    const tx = request.transactions[index];
+    if (
+      tx.unsigned_transaction_base64 &&
+      tx.unsigned_transaction_base64 === staged.committedWire
+    )
+      return true;
+    if (
+      tx.unsigned_transaction_base64 &&
+      tx.unsigned_transaction_base64 ===
+        staged.raw.unsigned_transaction_base64 &&
+      tx.cluster === staged.cluster &&
+      tx.payer === staged.raw.payer
+    )
+      return true;
+    // Lane 1 instructions become one transaction at commit. Compare instruction
+    // content after the backend strips its internal pending/lifecycle fields.
+    const raw = staged.raw;
+    return (
+      tx.cluster === staged.cluster &&
+      tx.payer === raw.payer &&
+      Boolean(raw.program_id) &&
+      tx.instructions.some((value) =>
+        sameInstruction(raw, value as RecordValue),
+      )
+    );
+  }
+  return false;
+}
+
+export function selectActivity(
+  events: readonly Event[],
+  pendingActions: readonly Action[] = [],
+  commits: readonly CommitView[] = [],
+) {
+  const ordered = [...events].sort((a, b) => a.sequence - b.sequence);
+  const turnId =
+    [...ordered]
+      .reverse()
+      .find(
+        (event) =>
+          event.type === "message" && event.sender === "user" && event.turn_id,
+      )?.turn_id ??
+    [...ordered].reverse().find((event) => event.turn_id)?.turn_id ??
+    null;
+  const skills = new Set<string>();
+  const staged = new Map<string, ActivityTransaction>();
+  /** Each pending id's card: a bundle's instruction ids share one. */
+  const byId = new Map<string, ActivityTransaction>();
+  /** The tool event that created each commit, for commits with no staged tx. */
+  const commitOrigins = new Map<
+    string,
+    { sequence: number; turnId: string | null }
+  >();
+  const actions = new Map<string, Action>();
+  const actionOrder = new Map<string, number>();
+  for (const event of ordered) {
+    if (event.type === "action") {
+      if (!actionOrder.has(event.id)) actionOrder.set(event.id, event.sequence);
+      const prior = actions.get(event.id);
+      if (!prior || prior.revision <= event.revision)
+        actions.set(event.id, event);
+      continue;
+    }
+    const tool = toolRecord(event);
+    if (!tool || tool.result.error || tool.result.is_error === true) continue;
+    const { name, result } = tool;
+    if (Array.isArray(result.commits))
+      for (const view of result.commits) {
+        const id = string(record(view)?.commit_id);
+        if (id && !commitOrigins.has(id))
+          commitOrigins.set(id, {
+            sequence: event.sequence,
+            turnId: event.turn_id,
+          });
+      }
+    if (Array.isArray(result.activated)) {
+      for (const id of result.activated)
+        if (typeof id === "string") skills.add(id);
+    }
+    // The family comes from the payload: prepared records name it, Solana
+    // records carry a cluster, EVM ones a chain id. A tool's name says
+    // nothing (a "jupiter" app may stage on EVM).
+    const familyOf = (
+      value: Record<string, unknown>,
+      fallback: "svm" | "evm",
+    ) =>
+      value.chain_kind === "svm" || value.chain_kind === "evm"
+        ? value.chain_kind
+        : typeof value.cluster === "string"
+          ? "svm"
+          : value.chain_id != null
+            ? "evm"
+            : fallback;
+    const family = familyOf(result, name.startsWith("svm_") ? "svm" : "evm");
+    if (name === "evm_discard_tx" || name === "svm_discard_tx") {
+      const discarded = new Set(ids(result.discarded));
+      // Pending ids are unique per family and thread across networks, not
+      // scoped to the turn that staged them. Replay removes the same drafts.
+      for (const [key, tx] of staged) {
+        const pendingId =
+          number(tx.raw.pending_tx_id) ?? number(tx.raw.pending_ix_id);
+        if (
+          tx.family === family &&
+          pendingId != null &&
+          discarded.has(pendingId)
+        )
+          staged.delete(key);
+      }
+      continue;
+    }
+    // Protocol staging tools list their pending txs under `staged`; the
+    // chain stage tools return one record (SVM wraps it in `tx` or `ix`).
+    const stagedRecords = Array.isArray(result.staged)
+      ? result.staged
+      : Array.isArray(result.instructions)
+        ? [instructionBundle(result.instructions)]
+        : [record(result.tx) ?? record(result.ix) ?? result];
+    for (const raw of stagedRecords) {
+      const tx = record(raw);
+      if (!tx) continue;
+      const members = stagedIds(tx);
+      const pendingId = members[0];
+      const txFamily = familyOf(tx, family);
+      if (pendingId != null && tx.current_lifecycle === "queued") {
+        const id = `${event.turn_id}:${txFamily}:${pendingId}`;
+        const previous = staged.get(id);
+        const item: ActivityTransaction = {
+          id,
+          sequence: previous?.sequence ?? event.sequence,
+          turnId: event.turn_id,
+          family: txFamily,
+          label:
+            string(tx.label) ??
+            string(tx.description) ??
+            `Transaction ${pendingId}`,
+          kind: string(tx.kind) ?? "transaction",
+          chainId: number(tx.chain_id),
+          cluster: string(tx.cluster),
+          raw: tx,
+          stage: previous?.stage ?? "staged",
+        };
+        staged.set(id, item);
+        for (const member of members)
+          byId.set(`${event.turn_id}:${txFamily}:${member}`, item);
+      }
+    }
+    // Retired Jupiter tool: its staged ids came back as `ix_ids`.
+    if (name === "jupiter_prepare_swap")
+      for (const id of ids(result.ix_ids)) {
+        const key = `${event.turn_id}:svm:${id}`;
+        if (!staged.has(key)) {
+          const item: ActivityTransaction = {
+            id: key,
+            sequence: event.sequence,
+            turnId: event.turn_id,
+            family: "svm",
+            label: string(result.description) ?? "Jupiter swap instruction",
+            kind: "swap",
+            cluster: string(result.cluster),
+            raw: { ...result, pending_ix_id: id },
+            stage: "staged",
+          };
+          staged.set(key, item);
+          byId.set(key, item);
+        }
+      }
+    const sim = record(result.simulation);
+    if (sim) {
+      const affected = ids(
+        result.resolved_ids ??
+          result.tx_ids ??
+          result.ix_ids ??
+          (typeof result.tx_id === "number" ? [result.tx_id] : []),
+      );
+      const success =
+        summarizeSimulation(sim)?.passed ??
+        (typeof sim.batch_success === "boolean"
+          ? sim.batch_success
+          : "err" in sim
+            ? sim.err == null
+            : undefined);
+      if (success !== undefined)
+        for (const id of affected) {
+          const item = byId.get(`${event.turn_id}:${family}:${id}`);
+          if (item && !item.action)
+            item.stage = success ? "simulated" : "simulation-failed";
+        }
+    }
+    if (
+      ["pending_approval", "broadcast_inflight", "aa_sign_request"].includes(
+        String(result.status),
+      )
+    ) {
+      for (const id of ids(
+        result.tx_ids ?? result.svm_ix_ids ?? result.ix_ids,
+      )) {
+        const item = byId.get(`${event.turn_id}:${family}:${id}`);
+        if (item) {
+          item.stage = "committed";
+          item.committedWire = string(result.unsigned_tx);
+        }
+      }
+    }
+  }
+  for (const action of pendingActions) {
+    const previous = actions.get(action.id);
+    if (!previous || previous.revision <= action.revision)
+      actions.set(action.id, action);
+  }
+  const transactions = [...staged.values()];
+  for (const action of actions.values()) {
+    const request = action.request;
+    const count = request.type === "sign" ? 1 : request.transactions.length;
+    for (let index = 0; index < count; index++) {
+      const linkedStage =
+        request.type === "execute_evm" &&
+        "commitStages" in request &&
+        Array.isArray(request.commitStages)
+          ? request.commitStages[index]
+          : undefined;
+      const linkedCommit =
+        typeof linkedStage === "string"
+          ? commits.find((commit) => commit.stage_id === linkedStage)
+          : undefined;
+      let matches = transactions.filter(
+        (tx) =>
+          !tx.action &&
+          tx.turnId === action.turn_id &&
+          (linkedStage
+            ? tx.id === linkedStage || sameTransaction(tx, action, index)
+            : sameTransaction(tx, action, index)),
+      );
+      if (
+        request.type === "execute_svm" &&
+        matches.length > 1 &&
+        !matches[0].committedWire
+      ) {
+        // Preserve multiplicity: two identical staged instructions do not both
+        // become signed when the assembled transaction contains only one.
+        const candidates = [...matches];
+        matches = [];
+        for (const ix of request.transactions[index].instructions) {
+          const found = candidates.findIndex((candidate) =>
+            sameInstruction(candidate.raw, ix as RecordValue),
+          );
+          if (found >= 0) matches.push(...candidates.splice(found, 1));
+        }
+        if (!matches.length && candidates.length) matches = [candidates[0]];
+      }
+      const match = matches[0];
+      if (match) {
+        Object.assign(match, {
+          stage: "committed",
+          sequence:
+            match.sequence ?? actionOrder.get(action.id) ?? action.sequence,
+          turnId: action.turn_id,
+          action,
+          actionIndex: index,
+          commit: linkedCommit ?? match.commit,
+        });
+        if (request.type === "execute_svm") {
+          const assembled = request.transactions[index];
+          match.label = svmTransactionLabel(assembled, match.label);
+          for (const duplicate of matches.slice(1))
+            transactions.splice(transactions.indexOf(duplicate), 1);
+        }
+        continue;
+      }
+      const raw = (request.type === "sign"
+        ? request
+        : request.transactions[index]) as unknown as RecordValue;
+      transactions.push({
+        id: `${action.id}:${index}`,
+        sequence: actionOrder.get(action.id) ?? action.sequence,
+        turnId: action.turn_id,
+        family:
+          request.type === "execute_svm" ||
+          (request.type === "sign" && request.chainFamily === "svm")
+            ? "svm"
+            : "evm",
+        label:
+          request.type === "execute_svm"
+            ? svmTransactionLabel(request.transactions[index])
+            : (string(raw.label) ??
+              string(raw.description) ??
+              (request.type === "sign"
+                ? "Sign wallet request"
+                : `Transaction ${index + 1}`)),
+        kind:
+          request.type === "sign"
+            ? "signature"
+            : (string(raw.kind) ?? "transaction"),
+        chainId: number(raw.chain_id) ?? number(raw.chainId),
+        cluster: string(raw.cluster),
+        raw,
+        stage: "committed",
+        action,
+        actionIndex: index,
+        commit: linkedCommit,
+      });
+    }
+  }
+  for (const commit of commits) {
+    // The staged ids a commit carries: its batch's own sources, else its stage
+    // id `<family>:<id>,<id>…` (a single commit, such as a Solana Ask).
+    const sourceIds = commit.batch
+      ? commit.batch.sources
+          .filter(
+            (source) =>
+              source.thread_id === commit.thread_id &&
+              source.chain_family === commit.chain_family &&
+              source.chain_ref === commit.chain_ref &&
+              source.stage_id === commit.stage_id,
+          )
+          .map((source) => source.source_id)
+      : (commit.stage_id.split(":")[1] ?? "")
+          .split(",")
+          .filter((part) => part !== "")
+          .map(Number)
+          .filter(Number.isInteger);
+    for (const sourceId of sourceIds) {
+      const match = transactions.find((tx) => {
+        const sameChain =
+          tx.family === "evm"
+            ? tx.chainId != null && String(tx.chainId) === commit.chain_ref
+            : clusterRef(tx.cluster) === clusterRef(commit.chain_ref);
+        return (
+          tx.family === commit.chain_family &&
+          stagedIds(tx.raw).includes(sourceId) &&
+          sameChain
+        );
+      });
+      if (match) {
+        match.stage = "committed";
+        match.commit = commit;
+      }
+    }
+  }
+  // A message signature stages nothing: its commit is its own row.
+  for (const commit of commits) {
+    const review = commit.review?.request;
+    if (!isMessageReview(review)) continue;
+    const origin = commitOrigins.get(commit.commit_id);
+    transactions.push({
+      id: `commit:${commit.commit_id}`,
+      sequence: origin?.sequence,
+      turnId: origin?.turnId ?? null,
+      family: commit.chain_family,
+      label: review.description || "Sign message",
+      kind: "message",
+      // Only a chain the message names; the commit's own is the wallet's.
+      ...(commit.chain_family === "svm"
+        ? { cluster: commit.chain_ref }
+        : { chainId: messageChainId([commit as unknown as RecordValue]) }),
+      raw: {},
+      stage: "committed",
+      commit,
+    });
+  }
+  return {
+    turnId,
+    agents: Object.values(selectTaskRuns(ordered)),
+    skills: [...skills],
+    history: transactions.filter((tx) =>
+      tx.action ? tx.action.state !== "pending" : tx.turnId !== turnId,
+    ),
+    transactions: transactions.filter(
+      (tx) => tx.turnId === turnId || tx.action?.state === "pending",
+    ),
+  };
+}
+
+/** Keep compatibility Actions only when no durable source owns that Action. */
+export function selectLegacyReviewAction(
+  events: readonly Event[],
+  actions: readonly Action[],
+  commits: readonly CommitView[],
+): Action | undefined {
+  const activity = selectActivity(events, actions, commits);
+  const durableActionIds = new Set(
+    [...activity.transactions, ...activity.history]
+      .filter((transaction) => transaction.commit)
+      .map((transaction) => transaction.action?.id)
+      .filter((id): id is string => Boolean(id)),
+  );
+  return actions.find((action) => !durableActionIds.has(action.id));
+}

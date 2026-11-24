@@ -1,0 +1,1617 @@
+import type {
+  Action,
+  AgentTarget,
+  Event,
+  EventPage,
+  MessageEvent,
+  StartTurnIntent,
+  TurnState,
+} from "../agent/types";
+import { ActionHandler } from "../actions";
+import {
+  CommitController,
+  isTerminalCommit,
+  type CommitReview,
+  type CommitView,
+} from "../commits";
+import { AgentApiError } from "../agent/transport";
+import { isAomiError } from "../api-error";
+import { GuestSignInError } from "../guest-auth";
+import { AomiClient } from "../client";
+import { conversationMessages } from "./conversation";
+import { activeWalletOf, type AomiActiveWallet } from "../account/wallets";
+import type { AomiClientOptions } from "../types";
+import type {
+  SendOptions,
+  SendResult,
+  SessionOptions,
+  SessionRuntimeOptions,
+  SessionSnapshot,
+} from "./types";
+
+export { aaModeFromExecutionKind } from "../aa/policy";
+export type {
+  Event,
+  EventPage,
+  SendOptions,
+  SendResult,
+  SessionOptions,
+  SessionRuntimeOptions,
+  SessionSnapshot,
+  TurnState,
+} from "./types";
+
+const TERMINAL_TURN_STATES = new Set<TurnState>([
+  "complete",
+  "interrupted",
+  "failed",
+]);
+const TERMINAL_EVENT_DRAIN_MS = 60_000;
+
+/** One Agent session reduced from its single ordered Event stream. */
+export class ClientSession {
+  readonly client: AomiClient;
+  readonly sessionId: string;
+  readonly actions: ActionHandler;
+  readonly commits: CommitController;
+
+  private target?: AgentTarget;
+  private app?: string;
+  private model?: string | null;
+  private applicationId?: number | string | null;
+  private getUserState?: SessionOptions["getUserState"];
+  private clientId: string;
+  private logger?: { debug: (...args: unknown[]) => void };
+  private cursor?: string;
+  private turnId?: string;
+  private acceptedTurnId?: string;
+  private turnState?: TurnState;
+  private startOperation?: {
+    message: string;
+    regenerate?: string;
+    edit?: string;
+    idempotencyKey: string;
+    intent?: StartTurnIntent;
+    apiKey?: string;
+    sinceSequence: number;
+    uncertain?: boolean;
+    error?: unknown;
+    turnId?: string;
+  };
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private streamingActive = false;
+  private streamInFlight = false;
+  private streamFailureCount = 0;
+  private streamAbort?: AbortController;
+  private liveMessages = new Map<string, MessageEvent>();
+  private liveRevisions = new Map<string, number>();
+  private terminalDrainUntil?: number;
+  private terminalTurnId?: string;
+  private isSubmitting = false;
+  private activeSubmission?: {
+    message: string;
+    options: SendOptions;
+    promise: Promise<EventPage>;
+  };
+  private interruptOperation?: Promise<void>;
+  private acknowledgedInterrupts = new Set<string>();
+  private terminalAcknowledgments = new Map<
+    string,
+    "complete" | "failed" | "interrupted"
+  >();
+  private supersededTurns = new Set<string>();
+  private callbackOwners = new Map<string, string>();
+  private pendingSteers: string[] = [];
+  private pendingUserMessage?: {
+    content: string;
+    sinceSequence: number;
+    turnId?: string;
+    replaces?: string;
+  };
+  private events: Event[] = [];
+  private eventIds = new Set<string>();
+  private messages: MessageEvent[] = [];
+  private storeVersion = 0;
+  private cachedStore?: {
+    version: number;
+    events: Event[];
+    messages: MessageEvent[];
+  };
+  private lastPageNewEvents = 0;
+  private title?: string;
+  /** The thread's active wallet ids, as the backend last reported them. */
+  private activeWallet?: AomiActiveWallet;
+  private error?: unknown;
+  private sentAt?: number;
+  private timingTurnId?: string;
+  private timing?: {
+    startedAt: number;
+    acknowledgedMs?: number;
+    firstTextReceivedMs?: number;
+  };
+  private closed = false;
+  /** The anonymous user this chat belongs to, once the backend has seen it. */
+  private guestOwner: string | null = null;
+  private pendingReject: ((error: unknown) => void) | null = null;
+  private pendingResolve: ((result: SendResult) => void) | null = null;
+  private pendingSend?: Promise<SendResult>;
+  private listeners = new Set<() => void>();
+  private actionUnsubscribers: Array<() => void> = [];
+  private snapshot: SessionSnapshot;
+  private applyingPage = false;
+  private pendingCommits = new Set<string>();
+  private pendingContinuations = new Map<string, "pending" | "completed">();
+  private commitDrainAfter?: number;
+
+  constructor(
+    clientOrOptions: AomiClient | AomiClientOptions,
+    sessionOptions?: SessionOptions,
+  ) {
+    this.client =
+      clientOrOptions instanceof AomiClient
+        ? clientOrOptions
+        : new AomiClient(clientOrOptions);
+    this.sessionId = sessionOptions?.sessionId ?? crypto.randomUUID();
+    this.target = normalizeTarget(sessionOptions?.target);
+    this.app = normalizeOptionalString(sessionOptions?.app);
+    this.model = sessionOptions?.model;
+    this.applicationId = sessionOptions?.applicationId;
+    assertTargetCompatibility({
+      target: this.target,
+      app: this.app,
+      applicationId: this.applicationId,
+    });
+    this.getUserState = sessionOptions?.getUserState;
+    this.clientId = sessionOptions?.clientId ?? crypto.randomUUID();
+    this.logger = sessionOptions?.logger;
+    this.commits = new CommitController(
+      this.client,
+      this.sessionId,
+      sessionOptions?.commits,
+    );
+    this.actions = new ActionHandler(
+      sessionOptions?.actions ?? {},
+      (action, result, idempotencyKey) =>
+        this.client.agent.respondToAction(
+          this.sessionId,
+          action.id,
+          action.revision,
+          result,
+          idempotencyKey,
+        ),
+      this.commits,
+    );
+    this.actionUnsubscribers.push(
+      this.commits.subscribe(() => {
+        for (const view of this.commits.all()) {
+          if (!isTerminalCommit(view)) this.pendingCommits.add(view.commit_id);
+          else if (this.pendingCommits.delete(view.commit_id)) {
+            this.commitDrainAfter = this.events.at(-1)?.sequence ?? 0;
+            this.terminalTurnId = this.turnId;
+            this.terminalDrainUntil = Date.now() + TERMINAL_EVENT_DRAIN_MS;
+            this.startStreaming();
+          }
+          // Only the callback owner projects delivery metadata. A sibling
+          // shares the batch identity but cannot cancel its owner's wake.
+          if (!view.continuation) continue;
+          const callbackTurnId = `broadcast-terminal:${view.batch?.batch_id ?? view.commit_id}`;
+          if (
+            view.continuation?.state === "pending" ||
+            view.continuation?.state === "retrying"
+          ) {
+            this.pendingContinuations.set(callbackTurnId, "pending");
+          } else if (
+            view.continuation?.state === "completed" &&
+            this.pendingContinuations.has(callbackTurnId)
+          ) {
+            this.pendingContinuations.set(callbackTurnId, "completed");
+            this.resumeCompletedCallbacks();
+          } else {
+            this.pendingContinuations.delete(callbackTurnId);
+          }
+        }
+        if (!this.applyingPage) this.publish();
+      }),
+    );
+    this.snapshot = this.buildSnapshot();
+    this.actionUnsubscribers.push(
+      this.actions.subscribe(() => {
+        if (!this.applyingPage) this.publish();
+      }),
+      this.actions.on("resolved", (action) => {
+        this.applyResolvedAction(action);
+        this.startStreaming();
+      }),
+    );
+  }
+
+  getSnapshot = (): SessionSnapshot => this.snapshot;
+
+  /**
+   * Record the thread's active wallet after an explicit switch
+   * (`PUT /api/thread/wallet`), before the next event page confirms it.
+   */
+  setActiveWallet(active: AomiActiveWallet): void {
+    if (this.adoptActiveWallet(active)) this.publish();
+  }
+
+  private adoptActiveWallet(active: AomiActiveWallet | undefined): boolean {
+    if (!active) return false;
+    const current = this.activeWallet ?? {};
+    if (current.evm === active.evm && current.svm === active.svm) return false;
+    this.activeWallet = active;
+    return true;
+  }
+
+  subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+
+  async send(message: string, options: SendOptions = {}): Promise<SendResult> {
+    const page = await this.submit(message, options);
+    if (this.isTerminal()) {
+      this.drainTerminalPage(page);
+      // The drain may still be polling for the trailing final message /
+      // title; only a finished drain has the complete result in hand.
+      if (!this.streamingActive) return this.result();
+    } else if (this.turnState !== "awaiting_action" || page.has_more) {
+      this.startStreaming();
+    }
+    // A high-level run may hand off a durable commit and close this session
+    // while the submitted page is still unwinding. Do not park a new waiter
+    // after close() has already drained pending sends.
+    if (this.closed) return this.result();
+    this.pendingSend ??= new Promise((resolve, reject) => {
+      this.pendingResolve = resolve;
+      this.pendingReject = reject;
+    });
+    return this.pendingSend;
+  }
+
+  async sendAsync(
+    message: string,
+    options: SendOptions = {},
+  ): Promise<EventPage> {
+    const page = await this.submit(message, options);
+    if (this.isTerminal()) {
+      this.drainTerminalPage(page);
+      return page;
+    }
+    if (this.turnState !== "awaiting_action" || page.has_more) {
+      this.startStreaming();
+    }
+    return page;
+  }
+
+  /**
+   * Add a follow-up to the running turn; the turn takes it at its next model
+   * call. Resolves `false` when no turn is running: send it instead.
+   */
+  async steer(message: string): Promise<boolean> {
+    this.assertOpen();
+    const text = message.trim();
+    if (!text) throw new TypeError("message is required");
+    this.pendingSteers.push(text);
+    this.publish();
+    try {
+      await this.client.agent.steer(this.sessionId, text);
+      this.startStreaming();
+      return true;
+    } catch (error) {
+      const queued = this.pendingSteers.indexOf(text);
+      if (queued >= 0) this.pendingSteers.splice(queued, 1);
+      this.publish();
+      if (!(error instanceof AgentApiError)) throw error;
+      // The turn just ended: send once this session has seen that end too.
+      if (error.code === "no_active_turn") {
+        await this.turnEnded();
+        return false;
+      }
+      // A chat the server has not seen yet has no running turn either.
+      if (error.status === 404) return false;
+      throw error;
+    }
+  }
+
+  /** Resolves once the stream delivers the running turn's end (or after 10s). */
+  private turnEnded(): Promise<void> {
+    if (this.turnState !== "processing") return Promise.resolve();
+    this.startStreaming();
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        unsubscribe();
+        resolve();
+      };
+      const timer = setTimeout(done, 10_000);
+      const unsubscribe = this.subscribe(() => {
+        if (this.turnState !== "processing") done();
+      });
+    });
+  }
+
+  interrupt(): Promise<void> {
+    if (this.interruptOperation) return this.interruptOperation;
+    if (this.closed) return Promise.reject(new Error("Session is closed"));
+    const submission = this.activeSubmission?.promise;
+    if (
+      !submission &&
+      !this.startOperation?.uncertain &&
+      (!this.turnId || this.isTerminal())
+    ) {
+      return Promise.resolve();
+    }
+    // Install the operation before publishing: even a synchronous subscriber
+    // or another click must join the same request. A pending start must settle
+    // first so Stop never interrupts the previous turn by mistake.
+    const operation = Promise.resolve().then(async () => {
+      if (submission) {
+        try {
+          await submission;
+        } catch (error) {
+          // A definite client error means the backend refused the send; the send path already
+          // reports it. Timeouts and uncertain network/server errors may have
+          // accepted work and must remain visible to the caller of Stop.
+          if (isDefinitiveStartRejection(error)) return;
+          if (!this.startOperation?.uncertain) throw error;
+        }
+      }
+      if (this.closed) return;
+      const uncertainStart = this.startOperation?.uncertain
+        ? this.startOperation
+        : undefined;
+      const turnId = uncertainStart
+        ? await this.recoverUncertainStart(uncertainStart)
+        : this.turnId;
+      if (!turnId || (!uncertainStart && this.isTerminal())) return;
+      const page = await this.client.agent.interrupt(this.sessionId, turnId);
+      if (page.session_id !== this.sessionId) {
+        throw new TypeError(
+          "Agent response session does not match the request",
+        );
+      }
+      if (
+        (page.terminal_turn && page.terminal_turn.turn_id !== turnId) ||
+        (page.stopped_turn_id && page.stopped_turn_id !== turnId)
+      ) {
+        throw new TypeError("Agent response turn does not match the request");
+      }
+      const terminalEvent = page.events.findLast(
+        (event) =>
+          event.type === "turn_state_changed" &&
+          event.turn_id === turnId &&
+          TERMINAL_TURN_STATES.has(event.state),
+      );
+      const observedState =
+        this.turnId === turnId && this.isTerminal()
+          ? this.turnState
+          : undefined;
+      // The durable terminal event wins over older stopped-only responses.
+      // Completion or failure can settle while the Stop request is in flight.
+      const terminalState =
+        terminalEvent?.type === "turn_state_changed"
+          ? terminalEvent.state
+          : (observedState ??
+            page.terminal_turn?.state ??
+            (page.stopped_turn_id === turnId ? "interrupted" : undefined));
+      if (!terminalState || !TERMINAL_TURN_STATES.has(terminalState)) {
+        throw new Error("The server has not confirmed that generation stopped");
+      }
+      const outcome = terminalState as "complete" | "failed" | "interrupted";
+      const priorOutcome = this.terminalAcknowledgments.get(turnId);
+      const wasInterrupted = this.acknowledgedInterrupts.has(turnId);
+      this.terminalAcknowledgments.set(turnId, outcome);
+      if (outcome === "interrupted") this.acknowledgedInterrupts.add(turnId);
+      else this.acknowledgedInterrupts.delete(turnId);
+      try {
+        this.applyEventPage(page, this.turnId === turnId ? undefined : turnId);
+      } catch (error) {
+        if (priorOutcome)
+          this.terminalAcknowledgments.set(turnId, priorOutcome);
+        else this.terminalAcknowledgments.delete(turnId);
+        if (wasInterrupted) this.acknowledgedInterrupts.add(turnId);
+        else this.acknowledgedInterrupts.delete(turnId);
+        throw error;
+      }
+      this.error = undefined;
+      if (
+        this.startOperation === uncertainStart &&
+        uncertainStart?.turnId === turnId
+      ) {
+        this.startOperation = undefined;
+        this.pendingUserMessage = undefined;
+      }
+      if (outcome === "interrupted") {
+        for (const [key, message] of this.liveMessages) {
+          if (message.turn_id === turnId) {
+            this.liveMessages.set(key, { ...message, is_streaming: false });
+          }
+        }
+      }
+      // An older Stop response may arrive after the saved history recorded a
+      // newer turn. Keep its scoped outcome without stopping that newer stream.
+      if (this.turnId !== turnId) return;
+      this.turnState = outcome;
+      this.terminalTurnId = turnId;
+      if (outcome === "interrupted") {
+        this.finish();
+      } else {
+        // A winning completion may precede its durable final answer. Keep the
+        // normal bounded drain so that answer and its response key still land.
+        this.drainTerminalPage(page);
+      }
+    });
+    this.interruptOperation = operation.then(
+      () => {
+        this.interruptOperation = undefined;
+        this.resumeCompletedCallbacks();
+        this.publish();
+      },
+      (error: unknown) => {
+        this.interruptOperation = undefined;
+        this.error = error;
+        this.publish();
+        throw error;
+      },
+    );
+    this.error = undefined;
+    this.publish();
+    return this.interruptOperation;
+  }
+
+  syncRuntimeOptions(options: SessionRuntimeOptions): void {
+    const target = normalizeTarget(options.target);
+    const app = normalizeOptionalString(options.app);
+    assertTargetCompatibility({
+      target,
+      app,
+      applicationId: options.applicationId,
+    });
+    this.target = target;
+    this.app = app;
+    this.model = options.model;
+    this.applicationId = options.applicationId;
+    this.clientId = options.clientId ?? this.clientId;
+    this.getUserState = options.getUserState;
+    if (options.actions) this.actions.setCapabilities(options.actions);
+    if (options.commits) this.commits.setCapabilities(options.commits);
+  }
+
+  async sync(): Promise<EventPage> {
+    this.assertOpen();
+    return this.fetchPage();
+  }
+
+  async fetchCurrentState(): Promise<void> {
+    const page = await this.sync();
+    if (this.isTerminal()) this.finish();
+    else if (this.turnState && this.turnState !== "awaiting_action") {
+      this.startStreaming();
+    }
+    if (page.has_more) this.startStreaming();
+  }
+
+  startStreaming(): void {
+    if (this.streamingActive || this.closed) return;
+    this.streamingActive = true;
+    this.logger?.debug("[session] streaming started", this.sessionId);
+    this.publish();
+    this.scheduleReconnect(0);
+  }
+
+  stopStreaming(): void {
+    if (!this.streamingActive && !this.reconnectTimer) return;
+    this.streamingActive = false;
+    this.streamAbort?.abort();
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.logger?.debug("[session] streaming stopped", this.sessionId);
+    this.publish();
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.stopStreaming();
+    this.resolvePending();
+    for (const unsubscribe of this.actionUnsubscribers) unsubscribe();
+    this.actionUnsubscribers = [];
+    this.actions.close();
+    this.commits.close();
+    this.listeners.clear();
+  }
+
+  private submit(message: string, options: SendOptions): Promise<EventPage> {
+    this.assertOpen();
+    const text = message.trim();
+    if (this.activeSubmission) {
+      const active = this.activeSubmission;
+      if (
+        active.message === text &&
+        active.options.regenerate === options.regenerate &&
+        active.options.edit === options.edit
+      )
+        return active.promise;
+      return Promise.reject(new Error("A message is already being submitted"));
+    }
+    if (
+      this.startOperation?.uncertain &&
+      (this.startOperation.message !== text ||
+        this.startOperation.regenerate !== options.regenerate ||
+        this.startOperation.edit !== options.edit)
+    )
+      return Promise.reject(
+        new Error(
+          "Resolve the pending request before sending a different message",
+        ),
+      );
+    if (
+      this.interruptOperation ||
+      this.turnState === "processing" ||
+      this.turnState === "awaiting_action"
+    )
+      return Promise.reject(
+        new Error("Wait for the current generation to finish or stop it"),
+      );
+    const promise = Promise.resolve()
+      .then(() => this.performSubmit(message, options))
+      .finally(() => {
+        this.activeSubmission = undefined;
+      });
+    this.activeSubmission = { message: text, options: { ...options }, promise };
+    return promise;
+  }
+
+  private async performSubmit(
+    message: string,
+    options: SendOptions,
+  ): Promise<EventPage> {
+    this.assertOpen();
+    const guest = this.client.guestIdentity?.() ?? null;
+    if (this.guestOwner && guest && guest !== this.guestOwner)
+      throw AgentApiError.guestIdentityChanged();
+    if (options.regenerate !== undefined && !options.regenerate.trim()) {
+      throw new TypeError(
+        "regenerate requires a completed assistant message key",
+      );
+    }
+    if (options.edit !== undefined && !options.edit.trim()) {
+      throw new TypeError("edit requires a durable user message key");
+    }
+    if (options.edit !== undefined && options.regenerate !== undefined) {
+      throw new TypeError("edit and regenerate cannot be combined");
+    }
+    const text = message.trim();
+    if (!text) throw new TypeError("message is required");
+    const operation: NonNullable<ClientSession["startOperation"]> =
+      this.startOperation?.message === text &&
+      this.startOperation.regenerate === options.regenerate &&
+      this.startOperation.edit === options.edit
+        ? this.startOperation
+        : {
+            message: text,
+            regenerate: options.regenerate,
+            edit: options.edit,
+            idempotencyKey: `idem_${crypto.randomUUID().replaceAll("-", "")}`,
+            sinceSequence: this.events.at(-1)?.sequence ?? 0,
+            apiKey: options.apiKey,
+          };
+    this.startOperation = operation;
+    this.terminalDrainUntil = undefined;
+    this.terminalTurnId = undefined;
+    this.isSubmitting = true;
+    this.timingTurnId = undefined;
+    this.sentAt = performance.now();
+    this.timing = { startedAt: Date.now() };
+    // The start response and even the first polls may not carry the user's
+    // message event yet (it can trail in a later page). Hold an optimistic
+    // echo so consumers can render the outbound message immediately; it is
+    // cleared the moment the server's own user message event lands.
+    this.pendingUserMessage = {
+      content: text,
+      sinceSequence: this.events.at(-1)?.sequence ?? 0,
+      replaces: this.replacedUserMessageKey(options),
+    };
+    this.error = undefined;
+    this.publish();
+    let requested = false;
+    try {
+      if (!operation.intent) {
+        // Sent as selected. The backend applies the account's signing route
+        // (`UserState.route`) itself, so a Send needs no profile read first.
+        const state = this.getUserState?.();
+        const target = startTargetFields({
+          target: this.target,
+          app: this.app,
+          applicationId: this.applicationId,
+        });
+        // An uncertain start must replay exactly the same intent and key.
+        // Fresh operations refresh policy; the backend still checks permissions when it runs them.
+        operation.intent = {
+          sessionId: this.sessionId,
+          clientId: this.clientId,
+          message: text,
+          ...(operation.regenerate ? { regenerate: operation.regenerate } : {}),
+          ...(operation.edit ? { edit: operation.edit } : {}),
+          ...target,
+          ...(this.model ? { model: this.model } : {}),
+          ...(state
+            ? {
+                userState: structuredClone(state),
+              }
+            : {}),
+        };
+      }
+      // The cursor rides alongside the stored intent rather than inside it:
+      // it is a read position, not part of what was requested, and the stored
+      // intent must replay byte-for-byte on an uncertain start. The server
+      // strips it before hashing, so sending it never changes idempotency.
+      requested = true;
+      const page = await this.client.agent.start(
+        {
+          ...operation.intent,
+          ...(this.cursor ? { cursor: this.cursor } : {}),
+        },
+        {
+          idempotencyKey: operation.idempotencyKey,
+          apiKey: operation.apiKey,
+        },
+      );
+      if (this.timing && this.sentAt !== undefined)
+        this.timing.acknowledgedMs = performance.now() - this.sentAt;
+      if (page.session_id !== this.sessionId) {
+        throw new TypeError(
+          "Agent response session does not match the request",
+        );
+      }
+      operation.uncertain = false;
+      if (page.started_turn_id) {
+        // Bind the accepted identity before reducing a bounded historical page:
+        // only its own user event may clear the pending echo.
+        this.acceptedTurnId = page.started_turn_id;
+        this.turnId = page.started_turn_id;
+        this.timingTurnId = page.started_turn_id;
+        this.turnState = this.acknowledgedInterrupts.has(page.started_turn_id)
+          ? "interrupted"
+          : "processing";
+        this.terminalTurnId = undefined;
+        if (this.pendingUserMessage)
+          this.pendingUserMessage.turnId = page.started_turn_id;
+      }
+      this.applyEventPage(page);
+      if (page.started_turn_id) {
+        // A bounded start page may carry historical events only. Its accepted
+        // identity keeps Stop on the new run until its own events catch up.
+        this.acceptedTurnId = page.started_turn_id;
+        this.turnId = page.started_turn_id;
+        this.timingTurnId = page.started_turn_id;
+        const ownState = this.events.findLast(
+          (event) =>
+            event.type === "turn_state_changed" &&
+            event.turn_id === page.started_turn_id,
+        );
+        this.turnState =
+          ownState?.type === "turn_state_changed" &&
+          TERMINAL_TURN_STATES.has(ownState.state)
+            ? ownState.state
+            : this.acknowledgedInterrupts.has(page.started_turn_id)
+              ? "interrupted"
+              : ownState?.type === "turn_state_changed"
+                ? ownState.state
+                : "processing";
+        this.terminalTurnId = this.isTerminal()
+          ? page.started_turn_id
+          : undefined;
+        this.terminalDrainUntil = undefined;
+      }
+      this.startOperation = undefined;
+      return page;
+    } catch (error) {
+      this.error = error;
+      if (requested && !isDefinitiveStartRejection(error)) {
+        operation.uncertain = true;
+        operation.error = error;
+      } else {
+        this.pendingUserMessage = undefined;
+        this.startOperation = undefined;
+      }
+      throw error;
+    } finally {
+      this.isSubmitting = false;
+      this.resumeCompletedCallbacks();
+      this.publish();
+    }
+  }
+
+  private async recoverUncertainStart(
+    operation: NonNullable<ClientSession["startOperation"]>,
+  ): Promise<string | undefined> {
+    if (operation.turnId) return operation.turnId;
+    if (!operation.intent) throw operation.error;
+    const settleWithoutActiveTurn = (page?: EventPage) => {
+      // A fully read history needs no cancellation. Retain the exact
+      // request for a Send retry without keeping its optimistic running state.
+      // Terminal messages cannot establish request ownership by matching text.
+      operation.uncertain = false;
+      this.pendingUserMessage = undefined;
+      this.error = undefined;
+      if (page && this.isTerminal() && this.turnState !== "interrupted")
+        this.drainTerminalPage(page);
+      return undefined;
+    };
+    // History alone cannot correlate an active turn with this request. Use it
+    // only to find out whether the backend accepted it; never replay an idle request just
+    // to cancel it. Follow bounded pages before deciding there is no evidence.
+    while (!this.closed) {
+      const previousCursor = this.cursor;
+      const page = await this.fetchPage().catch((error: unknown) => {
+        if (
+          error instanceof AgentApiError &&
+          error.status === 404 &&
+          error.code === "session_not_found" &&
+          !error.retryable
+        )
+          return undefined;
+        throw operation.error;
+      });
+      if (!page) return settleWithoutActiveTurn();
+      const states = new Map<string, TurnState>();
+      for (const event of this.events) {
+        if (!event.turn_id || event.sequence <= operation.sinceSequence)
+          continue;
+        if (event.type === "branch") states.set(event.turn_id, "processing");
+        if (event.type === "turn_state_changed")
+          states.set(event.turn_id, event.state);
+      }
+      if (
+        [...states.values()].some((state) => !TERMINAL_TURN_STATES.has(state))
+      )
+        break;
+      if (!page.has_more) return settleWithoutActiveTurn(page);
+      if (this.cursor === previousCursor) throw operation.error;
+    }
+    if (this.closed) throw new Error("Session is closed");
+    // Replaying the exact stored intent/key returns the turn it started,
+    // independent of history position. A different client's active turn is
+    // never a Stop target. Runtime option changes cannot alter this replay.
+    const page = await this.client.agent.start(
+      { ...operation.intent, ...(this.cursor ? { cursor: this.cursor } : {}) },
+      {
+        idempotencyKey: operation.idempotencyKey,
+        apiKey: operation.apiKey,
+      },
+    );
+    if (page.session_id !== this.sessionId || !page.started_turn_id)
+      throw new TypeError("Unable to confirm the pending request's turn");
+    this.applyEventPage(page, page.started_turn_id);
+    operation.turnId = page.started_turn_id;
+    if (!this.turnId || this.isTerminal() || this.turnId === operation.turnId) {
+      this.acceptedTurnId = operation.turnId;
+      this.turnId = operation.turnId;
+      const ownState = this.events.findLast(
+        (event) =>
+          event.type === "turn_state_changed" &&
+          event.turn_id === operation.turnId,
+      );
+      this.turnState =
+        ownState?.type === "turn_state_changed" ? ownState.state : "processing";
+      if (this.pendingUserMessage)
+        this.pendingUserMessage.turnId = operation.turnId;
+    }
+    if (
+      this.events.some(
+        (event) =>
+          event.type === "message" &&
+          event.sender === "user" &&
+          event.turn_id === operation.turnId &&
+          event.sequence > operation.sinceSequence,
+      )
+    )
+      this.pendingUserMessage = undefined;
+    if (!this.isTerminal()) this.startStreaming();
+    return operation.turnId;
+  }
+
+  private async fetchPage(): Promise<EventPage> {
+    try {
+      const page = await this.client.agent.poll(this.sessionId, {
+        cursor: this.cursor,
+      });
+      this.applyEventPage(page);
+      return page;
+    } catch (error) {
+      if (
+        !(error instanceof AgentApiError) ||
+        !["invalid_cursor", "cursor_expired"].includes(error.code)
+      ) {
+        throw error;
+      }
+      this.cursor = undefined;
+      const page = await this.client.agent.poll(this.sessionId);
+      this.applyEventPage(page);
+      return page;
+    }
+  }
+
+  private applyEventPage(page: EventPage, inactiveTurnId?: string): void {
+    if (page.session_id !== this.sessionId) {
+      throw new TypeError("Agent response session does not match the request");
+    }
+    this.guestOwner ??= this.client.guestIdentity?.() ?? null;
+    this.applyingPage = true;
+    this.lastPageNewEvents = 0;
+    try {
+      for (const view of page.commits ?? []) this.commits.ingest(view);
+      this.adoptActiveWallet(activeWalletOf(page.active_wallet));
+      for (const event of page.events) {
+        if (event.type === "action" && this.replaceActionEvent(event)) {
+          this.actions.ingest(event);
+          this.lastPageNewEvents += 1;
+          if (
+            (!inactiveTurnId || event.turn_id !== inactiveTurnId) &&
+            this.canOwnActiveTurn(event)
+          ) {
+            this.turnId = event.turn_id ?? this.turnId;
+          }
+          continue;
+        }
+        if (this.eventIds.has(event.event_id)) {
+          if (event.type === "action") this.actions.ingest(event);
+          continue;
+        }
+        const previous = this.events.at(-1);
+        if (previous && event.sequence <= previous.sequence) {
+          throw new TypeError("Agent events are not monotonically ordered");
+        }
+        this.eventIds.add(event.event_id);
+        this.events.push(event);
+        this.storeVersion += 1;
+        this.lastPageNewEvents += 1;
+        this.trackCallbackOwner(event);
+        const ownsActiveTurn =
+          (!inactiveTurnId || event.turn_id !== inactiveTurnId) &&
+          this.canOwnActiveTurn(event);
+        const staleBusyState =
+          event.type === "turn_state_changed" &&
+          event.turn_id !== null &&
+          (this.acknowledgedInterrupts.has(event.turn_id) ||
+            this.terminalAcknowledgments.has(event.turn_id)) &&
+          !TERMINAL_TURN_STATES.has(event.state);
+        if (ownsActiveTurn && !staleBusyState)
+          this.turnId = event.turn_id ?? this.turnId;
+        switch (event.type) {
+          case "message":
+            if (
+              event.tool_result &&
+              [
+                "commit_txs",
+                "evm_commit_txs",
+                "svm_commit_txs",
+                "svm_commit_ix",
+                "svm_commit_tx",
+              ].includes(event.tool_name?.split("::").at(-1) ?? "")
+            ) {
+              try {
+                const result = JSON.parse(event.tool_result[1]) as {
+                  commits?: CommitView[];
+                  reviews?: Record<string, CommitReview>;
+                };
+                for (const [id, review] of Object.entries(result.reviews ?? {}))
+                  this.commits.ingestReview(id, review);
+                for (const view of result.commits ?? [])
+                  this.commits.ingest(view);
+              } catch {
+                /* A failed tool has no commit view. */
+              }
+            }
+            if (
+              event.sender === "agent" &&
+              event.turn_id === this.timingTurnId &&
+              !event.tool_result &&
+              event.content.trim()
+            )
+              this.recordTextReceipt();
+            if (event.message_key) {
+              this.liveMessages.delete(event.message_key);
+              this.liveRevisions.delete(event.message_key);
+              if (this.isCallbackResponse(event)) {
+                // The final stream is promoted from a temporary trace key to
+                // the durable response key. Retire only that draft; earlier
+                // commentary has its own durable message and remains visible.
+                for (const key of this.liveMessages.keys()) {
+                  if (key.startsWith(`${event.turn_id}:trace:`)) {
+                    this.liveMessages.delete(key);
+                    this.liveRevisions.delete(key);
+                  }
+                }
+              }
+            }
+            this.applyMessage(event);
+            if (event.message_key?.includes(":steer:")) {
+              const index = this.pendingSteers.indexOf(event.content);
+              if (index >= 0) this.pendingSteers.splice(index, 1);
+            }
+            if (
+              event.sender === "user" &&
+              ownsActiveTurn &&
+              !this.startOperation?.uncertain &&
+              this.pendingUserMessage &&
+              (!this.pendingUserMessage.turnId ||
+                event.turn_id === this.pendingUserMessage.turnId) &&
+              event.sequence > this.pendingUserMessage.sinceSequence
+            ) {
+              this.timingTurnId = event.turn_id ?? undefined;
+              this.acceptedTurnId = event.turn_id ?? undefined;
+              this.pendingUserMessage = undefined;
+            }
+            break;
+          case "turn_state_changed":
+            if (!ownsActiveTurn || staleBusyState) break;
+            this.turnState = event.state;
+            if (
+              this.terminalAcknowledgments.has(event.turn_id ?? "") &&
+              TERMINAL_TURN_STATES.has(event.state)
+            ) {
+              this.terminalAcknowledgments.set(
+                event.turn_id!,
+                event.state as "complete" | "failed" | "interrupted",
+              );
+            }
+            if (
+              event.state !== "interrupted" &&
+              TERMINAL_TURN_STATES.has(event.state) &&
+              event.turn_id
+            ) {
+              this.acknowledgedInterrupts.delete(event.turn_id);
+            }
+            if (event.state === "interrupted" && event.turn_id) {
+              this.acknowledgedInterrupts.add(event.turn_id);
+            }
+            if (TERMINAL_TURN_STATES.has(event.state)) {
+              this.terminalTurnId = event.turn_id ?? this.turnId;
+              // A turn that ended keeps the follow-ups it took in its events.
+              this.pendingSteers = [];
+            }
+            break;
+          case "branch":
+            if (ownsActiveTurn)
+              this.acceptedTurnId = event.turn_id ?? undefined;
+            // Branches from the first release kept the user message and sent
+            // no new user event, so nothing else would clear the echo.
+            if (!event.removed_message_keys.includes(event.user_message_key))
+              this.pendingUserMessage = undefined;
+            // The branch is itself an accepted run acknowledgment. Its
+            // processing event can be behind a page boundary, so retire the
+            // previous terminal scope immediately without inventing an event.
+            if (
+              ownsActiveTurn &&
+              !this.acknowledgedInterrupts.has(event.turn_id ?? "")
+            ) {
+              this.turnState = "processing";
+              this.terminalTurnId = undefined;
+              this.terminalDrainUntil = undefined;
+            }
+            for (const turnId of event.removed_turn_ids)
+              this.supersededTurns.add(turnId);
+            this.timingTurnId = event.turn_id ?? undefined;
+            for (const [key, message] of this.liveMessages) {
+              if (
+                event.removed_message_keys.includes(key) ||
+                (message.turn_id &&
+                  event.removed_turn_ids.includes(message.turn_id))
+              ) {
+                this.liveMessages.delete(key);
+                this.liveRevisions.delete(key);
+              }
+            }
+            break;
+          case "title_changed":
+            this.title = event.title;
+            break;
+          case "action":
+            this.actions.ingest(event);
+            break;
+        }
+      }
+      this.cursor = page.cursor;
+      this.error = undefined;
+    } finally {
+      this.applyingPage = false;
+    }
+    this.publish();
+  }
+
+  /** The user message an Edit or Rerun replaces, for its optimistic echo. */
+  private replacedUserMessageKey(options: SendOptions): string | undefined {
+    if (options.edit) return options.edit;
+    if (!options.regenerate) return undefined;
+    const messages = conversationMessages(this.events);
+    const answer = messages.findIndex(
+      (message) => message.message_key === options.regenerate,
+    );
+    return (
+      messages
+        .slice(0, Math.max(answer, 0))
+        .findLast((message) => message.sender === "user")?.message_key ??
+      undefined
+    );
+  }
+
+  /** Keep late wallet delivery in the audit ledger without changing Stop's target. */
+  private canOwnActiveTurn(event: Event): boolean {
+    const turnId = event.turn_id;
+    if (!turnId || event.type === "branch") return true;
+    if (this.supersededTurns.has(turnId)) return false;
+    if (turnId === this.turnId) return true;
+    if (
+      this.turnId &&
+      (turnId.startsWith("broadcast-terminal:") ||
+        (this.acceptedTurnId === this.turnId &&
+          (!this.isSubmitting || this.timingTurnId === this.turnId))) &&
+      (this.isSubmitting ||
+        (this.pendingUserMessage && !this.startOperation?.uncertain) ||
+        this.turnState === "processing" ||
+        this.turnState === "awaiting_action")
+    ) {
+      // A callback may continue its own wallet operation, but an older
+      // operation's receipt cannot take charge of a newer user/branch run.
+      return (
+        !this.pendingUserMessage &&
+        (!this.isSubmitting || this.timingTurnId === this.turnId) &&
+        turnId.startsWith("broadcast-terminal:") &&
+        this.callbackOwners.get(turnId) === this.turnId
+      );
+    }
+    return true;
+  }
+
+  private trackCallbackOwner(event: Event): void {
+    if (
+      !event.turn_id ||
+      (event.type !== "message" && event.type !== "tool_complete")
+    )
+      return;
+    if (
+      ![
+        "commit_txs",
+        "evm_commit_txs",
+        "svm_commit_txs",
+        "svm_commit_ix",
+        "svm_commit_tx",
+      ].includes(event.tool_name?.split("::").at(-1) ?? "")
+    )
+      return;
+    try {
+      const value: unknown =
+        event.type === "message"
+          ? event.tool_result
+            ? JSON.parse(event.tool_result[1])
+            : undefined
+          : event.result;
+      if (!value || typeof value !== "object") return;
+      const result = value as { commits?: unknown; status?: unknown };
+      const entries = Array.isArray(result.commits)
+        ? result.commits
+        : result.status === undefined ||
+            result.status === "pending_approval" ||
+            result.status === "commit_staged"
+          ? [result]
+          : [];
+      for (const entry of entries) {
+        if (!entry || typeof entry !== "object") continue;
+        const commit = entry as {
+          commit_id?: unknown;
+          batch?: { batch_id?: unknown };
+        };
+        const operationId = commit.batch?.batch_id ?? commit.commit_id;
+        if (typeof operationId !== "string" || !operationId) continue;
+        const callbackTurnId = `broadcast-terminal:${operationId}`;
+        if (!this.callbackOwners.has(callbackTurnId)) {
+          this.callbackOwners.set(callbackTurnId, event.turn_id);
+        }
+      }
+    } catch {
+      // Failed or malformed tool output does not establish callback ownership.
+    }
+  }
+
+  private applyMessage(event: MessageEvent): void {
+    const key = event.message_key ?? event.event_id;
+    const index = this.messages.findIndex(
+      (message) => (message.message_key ?? message.event_id) === key,
+    );
+    if (index >= 0) this.messages[index] = event;
+    else this.messages.push(event);
+  }
+
+  private applyResolvedAction(action: Action): void {
+    if (this.replaceActionEvent(action)) {
+      this.publish();
+      return;
+    }
+    if (this.eventIds.has(action.event_id)) return;
+    const previous = this.events.at(-1);
+    if (previous && action.sequence <= previous.sequence) return;
+    this.eventIds.add(action.event_id);
+    this.events.push(action);
+    this.storeVersion += 1;
+    this.publish();
+  }
+
+  private replaceActionEvent(action: Action): boolean {
+    const index = this.events.findIndex(
+      (event) => event.type === "action" && event.id === action.id,
+    );
+    if (index < 0) return false;
+    const current = this.events[index];
+    if (current?.type !== "action" || current.revision >= action.revision) {
+      return false;
+    }
+    this.events.splice(index, 1);
+    this.eventIds.delete(current.event_id);
+    const insertion = this.events.findIndex(
+      (event) => event.sequence > action.sequence,
+    );
+    if (insertion < 0) this.events.push(action);
+    else this.events.splice(insertion, 0, action);
+    this.eventIds.add(action.event_id);
+    this.storeVersion += 1;
+    return true;
+  }
+
+  private async connectStream(): Promise<void> {
+    if (!this.streamingActive || this.streamInFlight) return;
+    this.reconnectTimer = null;
+    this.streamInFlight = true;
+    try {
+      const streamAbort = new AbortController();
+      this.streamAbort = streamAbort;
+      await this.client.agent.stream(
+        this.sessionId,
+        { cursor: this.cursor, signal: this.streamAbort.signal },
+        (kind, data) => {
+          if (!this.streamingActive || streamAbort.signal.aborted) return;
+          if (kind === "page") {
+            const page = data as EventPage;
+            this.applyEventPage(page);
+            this.streamFailureCount = 0;
+            if (this.isTerminal()) this.drainTerminalPage(page);
+          } else if (kind === "message") {
+            this.applyLiveMessage(data);
+          } else if (kind === "resync") {
+            this.cursor = undefined;
+            this.streamAbort?.abort();
+          }
+        },
+      );
+    } catch (error) {
+      if (this.streamAbort?.signal.aborted) return;
+      if (
+        error instanceof AgentApiError &&
+        ["invalid_cursor", "cursor_expired"].includes(error.code)
+      )
+        this.cursor = undefined;
+      else if (
+        error instanceof AgentApiError &&
+        (!error.retryable || error.status === 501)
+      ) {
+        this.stopStreaming();
+        this.pendingReject?.(error);
+        this.pendingReject = null;
+        this.pendingResolve = null;
+        this.pendingSend = undefined;
+      }
+      this.streamFailureCount += 1;
+      this.error = error;
+      this.logger?.debug("[session] stream error", error);
+      this.publish();
+    } finally {
+      this.streamAbort = undefined;
+      this.streamInFlight = false;
+      if (this.streamingActive) {
+        this.scheduleReconnect(
+          this.streamFailureCount === 0
+            ? 0
+            : Math.min(500 * 2 ** (this.streamFailureCount - 1), 5_000),
+        );
+      }
+    }
+  }
+
+  private applyLiveMessage(value: unknown): void {
+    const frame = value as {
+      turn_id?: string;
+      revision?: number;
+      message?: Partial<MessageEvent>;
+    };
+    const message = frame?.message;
+    const key = message?.message_key;
+    if (
+      frame?.turn_id !== this.turnId ||
+      this.acknowledgedInterrupts.has(frame.turn_id ?? "") ||
+      this.supersededTurns.has(frame.turn_id ?? "") ||
+      !key ||
+      message?.sender !== "agent" ||
+      typeof message.content !== "string" ||
+      message.tool_result
+    )
+      return;
+    if (
+      key.startsWith(`${frame.turn_id}:trace:`) &&
+      this.messages.some(
+        (stored) =>
+          this.isCallbackResponse(stored) && stored.turn_id === frame.turn_id,
+      )
+    )
+      return;
+    if (
+      !Number.isSafeInteger(frame.revision) ||
+      (this.liveRevisions.get(key) ?? -1) >= frame.revision!
+    )
+      return;
+    // A late replay must never overwrite the committed message.
+    if (
+      this.messages.some(
+        (stored) => stored.message_key === key && !stored.is_streaming,
+      )
+    )
+      return;
+    if (message.content.trim()) this.recordTextReceipt();
+    this.liveRevisions.set(key, frame.revision!);
+    this.liveMessages.set(key, {
+      type: "message",
+      event_id: `live:${key}`,
+      message_key: key,
+      turn_id: frame.turn_id ?? null,
+      runtime_sequence: frame.revision,
+      sequence:
+        this.liveMessages.get(key)?.sequence ??
+        this.events.at(-1)?.sequence ??
+        0,
+      occurred_at: Date.now() / 1000,
+      sender: "agent",
+      content: message.content,
+      is_streaming: true,
+    });
+    this.publish();
+  }
+
+  private resumeCompletedCallbacks(): void {
+    for (const [turnId, state] of this.pendingContinuations) {
+      if (state === "completed" && this.resumeCompletedCallback(turnId))
+        this.pendingContinuations.delete(turnId);
+    }
+  }
+
+  private resumeCompletedCallback(turnId: string): boolean {
+    if (
+      this.closed ||
+      this.streamingActive ||
+      this.isSubmitting ||
+      this.interruptOperation ||
+      this.pendingUserMessage
+    )
+      return false;
+    if (
+      this.turnId !== turnId &&
+      (this.turnState === "processing" || this.turnState === "awaiting_action")
+    )
+      return false;
+    if (this.hasCompletedCallback(turnId)) return true;
+    // Delivery polling carries metadata only. Wake the existing bounded drain
+    // once when known delivery finishes beyond the original event window.
+    this.commitDrainAfter = this.events.at(-1)?.sequence ?? 0;
+    this.terminalTurnId = turnId;
+    this.terminalDrainUntil = Date.now() + TERMINAL_EVENT_DRAIN_MS;
+    this.startStreaming();
+    return true;
+  }
+
+  private hasCompletedCallback(turnId: string): boolean {
+    let latestState: Event | undefined;
+    for (let index = this.events.length - 1; index >= 0; index--) {
+      const event = this.events[index]!;
+      if (event.type === "turn_state_changed" && event.turn_id === turnId) {
+        latestState = event;
+        break;
+      }
+    }
+    const hasAnswer = this.events.some(
+      (event) =>
+        event.type === "message" &&
+        event.turn_id === turnId &&
+        this.isCallbackResponse(event) &&
+        event.content.trim().length > 0,
+    );
+    return (
+      ((latestState?.type === "turn_state_changed" &&
+        latestState.state === "complete") ||
+        this.terminalAcknowledgments.get(turnId) === "complete") &&
+      hasAnswer
+    );
+  }
+
+  private isCallbackResponse(message: MessageEvent): boolean {
+    return Boolean(
+      message.turn_id?.startsWith("broadcast-terminal:") &&
+      message.message_key === `${message.turn_id}:response` &&
+      message.sender === "agent" &&
+      message.is_streaming !== true,
+    );
+  }
+
+  private recordTextReceipt(): void {
+    if (
+      this.timing &&
+      this.sentAt !== undefined &&
+      this.timing.firstTextReceivedMs === undefined
+    ) {
+      this.timing.firstTextReceivedMs = performance.now() - this.sentAt;
+      this.logger?.debug("[session] first text received", {
+        sessionId: this.sessionId,
+        turnId: this.turnId,
+        ...this.timing,
+      });
+    }
+  }
+
+  private finish(): void {
+    this.commitDrainAfter = undefined;
+    this.terminalDrainUntil = undefined;
+    this.terminalTurnId = undefined;
+    this.pendingUserMessage = undefined;
+    this.stopStreaming();
+    this.resolvePending();
+    this.resumeCompletedCallbacks();
+  }
+
+  private drainTerminalPage(page: EventPage): void {
+    // A turn's final answer can trail its terminal state. Finish only after
+    // the current terminal turn has a settled, non-tool agent message and the
+    // current page is fully drained. Titles are asynchronous thread metadata:
+    // they may be unchanged, delayed, or absent, so they cannot be a sentinel.
+    if (!page.has_more && this.hasTerminalAnswer()) {
+      this.finish();
+      return;
+    }
+    this.terminalDrainUntil ??= Date.now() + TERMINAL_EVENT_DRAIN_MS;
+    if (
+      !page.has_more &&
+      this.lastPageNewEvents === 0 &&
+      Date.now() >= this.terminalDrainUntil
+    ) {
+      this.finish();
+      return;
+    }
+    this.startStreaming();
+  }
+
+  private hasTerminalAnswer(): boolean {
+    const turnId = this.terminalTurnId;
+    if (!turnId) return false;
+    if (turnId.startsWith("broadcast-terminal:")) {
+      const latestState = this.events.findLast(
+        (event) =>
+          event.type === "turn_state_changed" && event.turn_id === turnId,
+      );
+      const failed =
+        this.terminalAcknowledgments.get(turnId) === "failed" ||
+        (latestState?.type === "turn_state_changed" &&
+          latestState.state === "failed");
+      if (failed) {
+        return this.events.some(
+          (event) =>
+            event.type === "message" &&
+            event.turn_id === turnId &&
+            this.isCallbackResponse(event) &&
+            event.content.trim().length > 0,
+        );
+      }
+      return this.hasCompletedCallback(turnId);
+    }
+    return this.events.some(
+      (event) =>
+        event.type === "message" &&
+        (this.commitDrainAfter === undefined ||
+          event.sequence > this.commitDrainAfter) &&
+        event.turn_id === turnId &&
+        event.sender === "agent" &&
+        event.is_streaming !== true &&
+        !event.tool_result &&
+        event.content.trim().length > 0,
+    );
+  }
+
+  private isTerminal(): boolean {
+    return Boolean(this.turnState && TERMINAL_TURN_STATES.has(this.turnState));
+  }
+
+  private result(): SendResult {
+    return { messages: conversationMessages(this.events), title: this.title };
+  }
+
+  private resolvePending(): void {
+    const resolve = this.pendingResolve;
+    this.pendingResolve = null;
+    this.pendingReject = null;
+    this.pendingSend = undefined;
+    resolve?.(this.result());
+  }
+
+  private buildSnapshot(): SessionSnapshot {
+    // Keep the events/messages array identities stable across publishes that
+    // did not apply new events, so downstream memoized projections (React's
+    // useMemo on snapshot.events) don't rebuild every poll tick.
+    if (!this.cachedStore || this.cachedStore.version !== this.storeVersion) {
+      this.cachedStore = {
+        version: this.storeVersion,
+        events: [...this.events],
+        messages: conversationMessages(this.events),
+      };
+    }
+    return {
+      sessionId: this.sessionId,
+      ...(this.cursor ? { cursor: this.cursor } : {}),
+      ...(this.turnId ? { turnId: this.turnId } : {}),
+      ...(this.turnState ? { turnState: this.turnState } : {}),
+      events: this.cachedStore.events,
+      messages: this.cachedStore.messages,
+      liveMessages: [...this.liveMessages.values()],
+      actions: this.actions.all(),
+      commits: this.commits.all(),
+      ...(this.timing ? { timing: { ...this.timing } } : {}),
+      ...(this.title ? { title: this.title } : {}),
+      ...(this.activeWallet ? { activeWallet: this.activeWallet } : {}),
+      isStreaming: this.streamingActive,
+      isSubmitting: this.isSubmitting,
+      isStopping: Boolean(this.interruptOperation),
+      isStartUncertain: Boolean(this.startOperation?.uncertain),
+      terminalTurns: Array.from(
+        this.terminalAcknowledgments,
+        ([turnId, state]) => ({ turnId, state }),
+      ),
+      ...(!this.isSubmitting &&
+      !this.pendingUserMessage &&
+      this.turnId &&
+      this.acknowledgedInterrupts.has(this.turnId)
+        ? { stoppedTurnId: this.turnId }
+        : {}),
+      ...(this.pendingUserMessage
+        ? { pendingUserMessage: this.pendingUserMessage.content }
+        : {}),
+      ...(this.pendingUserMessage?.replaces
+        ? { pendingReplacesMessageKey: this.pendingUserMessage.replaces }
+        : {}),
+      ...(this.pendingSteers.length
+        ? { pendingSteers: [...this.pendingSteers] }
+        : {}),
+      actionAttempts: this.actions.allAttempts(),
+      ...(this.error === undefined ? {} : { error: this.error }),
+    };
+  }
+
+  private publish(): void {
+    this.snapshot = this.buildSnapshot();
+    for (const listener of this.listeners) listener();
+  }
+
+  private scheduleReconnect(delayMs: number): void {
+    if (!this.streamingActive || this.closed) return;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => void this.connectStream(), delayMs);
+  }
+
+  private assertOpen(): void {
+    if (this.closed) throw new Error("Session is closed");
+  }
+}
+
+function normalizeOptionalString(
+  value: string | undefined,
+): string | undefined {
+  const normalized = value?.trim();
+  return normalized || undefined;
+}
+
+function normalizeTarget(
+  target: AgentTarget | undefined,
+): AgentTarget | undefined {
+  if (!target) return undefined;
+  if (target.mode !== "direct") return { mode: "auto" };
+  const app = normalizeOptionalString(target.app);
+  if ("applicationId" in target && target.applicationId !== undefined) {
+    if (
+      !Number.isSafeInteger(target.applicationId) ||
+      target.applicationId <= 0
+    ) {
+      throw new TypeError("Direct applicationId must be a positive integer");
+    }
+    return {
+      mode: "direct",
+      applicationId: target.applicationId,
+      ...(app ? { app } : {}),
+    };
+  }
+  return { mode: "direct", ...(app ? { app } : {}) };
+}
+
+function assertTargetCompatibility(options: {
+  target?: AgentTarget;
+  app?: string;
+  applicationId?: number | string | null;
+}): void {
+  if (
+    options.target &&
+    (normalizeOptionalString(options.app) ||
+      normalizeApplicationId(options.applicationId) !== undefined)
+  ) {
+    throw new TypeError(
+      "target cannot be combined with legacy app or applicationId options",
+    );
+  }
+}
+
+function normalizeApplicationId(
+  value: number | string | null | undefined,
+): number | undefined {
+  if (value === null || value === undefined || value === "") return undefined;
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new TypeError("applicationId must be a positive integer");
+  }
+  return parsed;
+}
+
+function startTargetFields(options: {
+  target?: AgentTarget;
+  app?: string;
+  applicationId?: number | string | null;
+}): Pick<StartTurnIntent, "mode" | "app" | "applicationId"> {
+  if (options.target?.mode === "direct") {
+    return "applicationId" in options.target &&
+      options.target.applicationId !== undefined
+      ? {
+          mode: "direct",
+          applicationId: options.target.applicationId,
+          ...(options.target.app ? { app: options.target.app } : {}),
+        }
+      : {
+          mode: "direct",
+          ...(options.target.app ? { app: options.target.app } : {}),
+        };
+  }
+  if (options.target) return { mode: "auto" };
+
+  const applicationId = normalizeApplicationId(options.applicationId);
+  if (applicationId !== undefined) {
+    return {
+      applicationId,
+      ...(options.app ? { app: options.app } : {}),
+    };
+  }
+  return options.app ? { app: options.app } : {};
+}
+
+function isDefinitiveStartRejection(error: unknown): boolean {
+  // Guest sign-in failed before the start was sent, and the App gate refuses
+  // a loading App before it accepts a turn. Neither left work to stop.
+  if (error instanceof GuestSignInError || isAomiError(error, "app_loading"))
+    return true;
+  // A retryable admission limit still refused this attempt; it did not start
+  // a turn. Edge refusals can use the generic API error transport.
+  if (
+    isAomiError(error) &&
+    error.status === 429 &&
+    error.code !== "request_in_flight"
+  )
+    return true;
+  return (
+    error instanceof AgentApiError &&
+    !error.retryable &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    ![408, 429].includes(error.status) &&
+    error.code !== "request_in_flight"
+  );
+}

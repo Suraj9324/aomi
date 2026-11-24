@@ -1,0 +1,452 @@
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
+import { createInterface } from "node:readline/promises";
+import {
+  Aomi,
+  AomiError,
+  AomiPolicySentError,
+  CLIENT_TYPE_TS_CLI,
+  createGuestSessionProvider,
+  normalizeSolanaCluster,
+  oauth,
+  UserState,
+  wallet,
+  type AomiAuthStrategy,
+  type AomiPolicySigner,
+  type AgentTarget,
+  type SvmCluster,
+} from "@aomi-labs/client";
+import { viemSigner } from "@aomi-labs/client/viem";
+import {
+  createPublicClient,
+  createWalletClient,
+  http,
+  type Chain,
+  type Hex,
+} from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import * as chains from "viem/chains";
+import { grants, loadState, updateState, type CliState } from "./state";
+
+export const DEFAULT_BASE_URL = "https://aomi.chat";
+
+/** Exit codes: 0 ok, 1 error, 2 usage, 3 needs approval or sign-in. */
+export class CliError extends Error {
+  constructor(
+    message: string,
+    readonly exitCode = 1,
+  ) {
+    super(message);
+  }
+}
+
+export const usage = (message: string) => new CliError(message, 2);
+
+/** What every command that talks to Aomi accepts. */
+export type ConnectFlags = {
+  backendUrl?: string;
+  apiKey?: string;
+  privateKey?: string;
+  solanaPrivateKey?: string;
+  cluster?: SvmCluster;
+  rpcUrl?: string;
+  chain?: number;
+};
+
+export const baseUrlOf = (flags: ConnectFlags, state = loadState()) =>
+  (
+    flags.backendUrl ??
+    process.env.AOMI_BACKEND_URL ??
+    state.baseUrl ??
+    DEFAULT_BASE_URL
+  ).replace(/\/+$/, "");
+
+/** Everything the CLI asks for at sign-in, so one approval covers it. */
+const SCOPES = [
+  "agent:read",
+  "agent:write",
+  "agent:actions:resolve",
+  "pipeline:catalog",
+  "pipeline:execute",
+  "payments:submit",
+  "account:apps:read",
+  "account:apps:write",
+  "account:credentials:read",
+  "account:credentials:write",
+  "account:transaction-safety:read",
+  "account:transaction-safety:write",
+  "account:credits:read",
+  "account:credits:fund",
+  "account:usage:read",
+  "offline_access",
+];
+
+/** The saved device sign-in for this backend and its REST resource. */
+async function heldGrant(baseUrl: string) {
+  const issuer = `${baseUrl}/api/auth`;
+  const resource = `${new URL(baseUrl).origin}/v1`;
+  return (await grants.load()).find(
+    (grant) => grant.issuer === issuer && grant.resource === resource,
+  );
+}
+
+/** Where a sign-in shows its code: stderr, or a screen that draws it. */
+export type ShowCode = (code: { url: string; code: string }) => void;
+
+const codeOnStderr: ShowCode = ({ url, code }) => {
+  process.stderr.write(`Open ${url}\nCode ${code}\n`);
+};
+
+/** The device sign-in, against the grants file. */
+export async function deviceAuth(
+  baseUrl: string,
+  onCode: ShowCode = codeOnStderr,
+): Promise<AomiAuthStrategy> {
+  return oauth({
+    clientName: `Aomi CLI · ${hostname()}`,
+    scopes: SCOPES,
+    store: grants,
+    onCode,
+    openBrowser: openUrl,
+  });
+}
+
+async function signedIn(baseUrl: string): Promise<boolean> {
+  return (await heldGrant(baseUrl)) !== undefined;
+}
+
+/** `--cluster`: any spelling of a Solana cluster. */
+export function parseCluster(value: string): SvmCluster {
+  const cluster = normalizeSolanaCluster(value);
+  if (!cluster)
+    throw usage(`Unknown cluster ${value}; use mainnet, devnet or testnet`);
+  return cluster;
+}
+
+const clusterOf = (flags: { cluster?: SvmCluster }, state: CliState) =>
+  flags.cluster ?? state.cluster ?? "solana:mainnet";
+
+/** `--private-key` (or AOMI_PRIVATE_KEY): signs in headlessly and signs. */
+export function privateKeyOf(flags: ConnectFlags): `0x${string}` | undefined {
+  const key = (flags.privateKey ?? process.env.AOMI_PRIVATE_KEY)?.trim();
+  if (!key) return undefined;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(key))
+    throw usage("--private-key must be a 0x-prefixed 32-byte hex key");
+  return key as `0x${string}`;
+}
+
+/** `--solana-private-key` (or AOMI_SOLANA_PRIVATE_KEY): the same, by SIWS. */
+const solanaKeyOf = (flags: ConnectFlags) =>
+  (flags.solanaPrivateKey ?? process.env.AOMI_SOLANA_PRIVATE_KEY)?.trim() ||
+  undefined;
+
+/**
+ * The EVM key `connect` gave each client. A policy transaction is sent with
+ * it, never with a key read again later: the saved one can change while the
+ * owner is asked, and what was checked and shown is this one.
+ */
+const EVM_KEYS = new WeakMap<Aomi, Hex>();
+
+/**
+ * One `Aomi` for the command: signed in with `--private-key` (SIWE) or
+ * `--solana-private-key` (SIWS), else with the device grant from
+ * `aomi login`, else as a guest. The signer is the keys from the flags or
+ * `aomi wallets signer set`.
+ */
+export async function connect(
+  flags: ConnectFlags = {},
+  onCode?: ShowCode,
+): Promise<Aomi> {
+  const state = loadState();
+  const baseUrl = baseUrlOf(flags, state);
+  const key = privateKeyOf(flags);
+  const solanaKey = solanaKeyOf(flags);
+  const evmKey = key ?? (state.evmKey as `0x${string}` | undefined);
+  const svmKey = solanaKey ?? state.svmKey;
+  const cluster = clusterOf(flags, state);
+  const signer = {
+    evm: evmKey
+      ? viemSigner(
+          createWalletClient({
+            account: privateKeyToAccount(evmKey),
+            chain: chainOf(flags.chain ?? state.chain ?? 1),
+            transport: http(flags.rpcUrl),
+          }),
+        )
+      : undefined,
+    // Loaded only when used: @solana/web3.js is heavy and warns on import.
+    // `--rpc-url` serves the chosen cluster; other clusters use public RPCs.
+    svm: svmKey
+      ? (await import("@aomi-labs/client/solana")).solanaSigner(svmKey, {
+          cluster,
+          rpcUrls: flags.rpcUrl ? { [cluster]: flags.rpcUrl } : undefined,
+        })
+      : undefined,
+  };
+  const common = {
+    baseUrl,
+    apiKey: flags.apiKey ?? process.env.AOMI_API_KEY,
+    ...(signer.evm || signer.svm ? { signer } : {}),
+  };
+  const made = (options: ConstructorParameters<typeof Aomi>[0]) => {
+    const aomi = new Aomi(options);
+    if (evmKey) EVM_KEYS.set(aomi, evmKey);
+    return aomi;
+  };
+  if (key)
+    return made({
+      ...common,
+      auth: wallet(privateKeyToAccount(key), {
+        chainId: flags.chain ?? state.chain,
+      }),
+    });
+  if (solanaKey && signer.svm)
+    return made({ ...common, auth: wallet(signer.svm) });
+  if (await signedIn(baseUrl))
+    return made({ ...common, auth: await deviceAuth(baseUrl, onCode) });
+  return made({ ...common, guest: persistedGuest(baseUrl, state) });
+}
+
+/**
+ * The local keys as the wallet that puts a policy on chain: the EVM key signs
+ * typed data and sends a transaction itself, the Solana key signs and
+ * broadcasts. A family with no key has no method.
+ */
+export function policySigner(
+  aomi: Aomi,
+  flags: ConnectFlags,
+): AomiPolicySigner {
+  const { evm, svm } = aomi.wallet ?? {};
+  const key = EVM_KEYS.get(aomi);
+  const { signTypedData } = evm ?? {};
+  const { signTransaction, broadcastTransaction } = svm ?? {};
+  return {
+    evmAddress: evm?.address,
+    solanaAddress: svm?.address,
+    ...(signTypedData
+      ? {
+          signTypedData: async ({ typedData, chainId }) => {
+            const signed = await signTypedData({ typedData, chainId });
+            return typeof signed === "string" ? signed : signed.signature;
+          },
+        }
+      : {}),
+    ...(key
+      ? {
+          sendEvmTransaction: async ({ chainId, to, data, value }) => {
+            const on = {
+              chain: chainOf(chainId),
+              transport: http(flags.rpcUrl),
+            };
+            const hash = await createWalletClient({
+              account: privateKeyToAccount(key),
+              ...on,
+            }).sendTransaction({
+              to: to as Hex,
+              data: data as Hex,
+              value: BigInt(value),
+            });
+            // It is sent: with no receipt in time, the hash still goes back
+            // and Aomi's read of the chain says whether it landed.
+            const receipt = await createPublicClient(on)
+              .waitForTransactionReceipt({ hash })
+              .catch(() => null);
+            if (receipt && receipt.status !== "success")
+              throw new AomiPolicySentError(
+                hash,
+                new CliError(`The transaction reverted: ${hash}`),
+              );
+            return hash;
+          },
+        }
+      : {}),
+    ...(signTransaction && broadcastTransaction
+      ? {
+          sendSolanaTransaction: async ({ unsignedBase64, cluster }) => {
+            const signed = await signTransaction({
+              transactionBase64: unsignedBase64,
+              cluster,
+            });
+            const raw =
+              typeof signed === "string" ? signed : signed.signedTransaction;
+            if (!raw)
+              throw new CliError("The local signer returned no transaction");
+            return broadcastTransaction(raw, cluster);
+          },
+        }
+      : {}),
+  };
+}
+
+/** The guest bearer outlives the process, so its threads stay reachable. */
+function persistedGuest(baseUrl: string, state: CliState) {
+  const fresh = createGuestSessionProvider({ baseUrl });
+  let saved = state.guest?.baseUrl === baseUrl ? state.guest.token : null;
+  return Object.assign(
+    async (options?: { forceRefresh?: boolean }) => {
+      if (saved && !options?.forceRefresh) return saved;
+      saved = await fresh(options);
+      if (saved) updateState({ guest: { baseUrl, token: saved } });
+      return saved;
+    },
+    {
+      clear() {
+        fresh.clear();
+        updateState({ guest: undefined });
+      },
+    },
+  );
+}
+
+function chainOf(id: number): Chain {
+  return (
+    Object.values(chains).find((chain) => chain.id === id) ?? {
+      id,
+      name: `Chain ${id}`,
+      nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+      rpcUrls: { default: { http: [] } },
+    }
+  );
+}
+
+/** What a turn runs with: the thread, `--app` (else Auto), model and wallet. */
+export function turnOptions(
+  aomi: Aomi,
+  state: CliState,
+  overrides: {
+    thread?: string;
+    app?: string;
+    model?: string;
+    chain?: number;
+    cluster?: SvmCluster;
+    /** A new thread's wallet per family (`/wallet` before the first turn). */
+    walletPick?: { evm?: string; svm?: string };
+  } = {},
+) {
+  const app = overrides.app;
+  const target: AgentTarget = app ? { mode: "direct", app } : { mode: "auto" };
+  const evm = aomi.wallet?.evm?.address;
+  const svm = aomi.wallet?.svm?.address;
+  const chainId = overrides.chain ?? state.chain;
+  const userState = UserState.withExt(
+    {
+      ...(evm
+        ? { evm: { address: evm, ...(chainId ? { chain_id: chainId } : {}) } }
+        : {}),
+      ...(svm
+        ? { svm: { address: svm, cluster: clusterOf(overrides, state) } }
+        : {}),
+      ...(evm || svm ? { connection: { is_connected: true } } : {}),
+      ...(overrides.walletPick ? { wallet_pick: overrides.walletPick } : {}),
+    },
+    "client_type",
+    CLIENT_TYPE_TS_CLI,
+  );
+  return {
+    sessionId:
+      overrides.thread ??
+      (!state.owner || state.owner === ownerOf(aomi)
+        ? state.thread
+        : undefined) ??
+      randomUUID(),
+    target,
+    model: overrides.model ?? state.model,
+    clientId: clientIdOf(state),
+    userState,
+  };
+}
+
+/** This process's signer addresses, EVM first. */
+export const signerAddresses = (aomi: Aomi) =>
+  [aomi.wallet?.evm?.address, aomi.wallet?.svm?.address].filter(
+    (address): address is string => Boolean(address),
+  );
+
+/** Who a thread belongs to: another sign-in can't continue it. */
+export const ownerOf = (aomi: Aomi) =>
+  aomi.auth.mode === "wallet"
+    ? `wallet:${signerAddresses(aomi)[0]}`
+    : aomi.auth.mode;
+
+/** The secrets vault id, made once. */
+export function clientIdOf(state = loadState()): string {
+  if (state.clientId) return state.clientId;
+  const clientId = randomUUID();
+  updateState({ clientId });
+  return clientId;
+}
+
+/** Decimal chain ids only: `base` or `8453abc` are usage errors. */
+export function parseChain(value: string): number {
+  if (!/^\d+$/.test(value.trim()))
+    throw usage(
+      `Invalid chain ID "${value}". Use a decimal chain ID, such as 8453.`,
+    );
+  return Number(value.trim());
+}
+
+export function openUrl(url: string): void {
+  const [command, args] =
+    process.platform === "darwin"
+      ? ["open", [url]]
+      : process.platform === "win32"
+        ? ["cmd", ["/c", "start", "", url]]
+        : ["xdg-open", [url]];
+  spawn(command, args, { detached: true, stdio: "ignore" })
+    .on("error", () => undefined)
+    .unref();
+}
+
+export const out = (line = ""): void => void process.stdout.write(`${line}\n`);
+export const err = (line = ""): void => void process.stderr.write(`${line}\n`);
+export const json = (value: unknown): void => out(JSON.stringify(value));
+
+/** Rows as aligned columns; the first row is the header. */
+export function table(rows: string[][]): string[] {
+  const widths = rows[0]!.map((_, column) =>
+    Math.max(...rows.map((row) => row[column]!.length)),
+  );
+  return rows.map((row) =>
+    row
+      .map((cell, column) => cell.padEnd(widths[column]!))
+      .join("  ")
+      .trimEnd(),
+  );
+}
+
+/** Ask on stderr; outside a terminal the command needs `--yes`. */
+export async function confirm(question: string): Promise<boolean> {
+  if (!process.stdin.isTTY) throw usage("Pass --yes outside a terminal");
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return /^y(es)?$/i.test((await rl.question(`${question} [y/N] `)).trim());
+  } finally {
+    rl.close();
+  }
+}
+
+/** One line: the error, the server's reason, and what to do. */
+export function messageOf(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const { details, hint } = error as {
+    details?: { error?: { message?: string } };
+    hint?: string;
+  };
+  const reason = details?.error?.message;
+  return [error.message, reason, hint].filter(Boolean).join(": ");
+}
+
+/** An Aomi failure with the exit code it means here. */
+export function exitCodeOf(error: unknown): number {
+  if (error instanceof CliError) return error.exitCode;
+  if (
+    error instanceof AomiError &&
+    (error.status === 401 ||
+      ["insufficient_scope", "interaction_required", "invalid_token"].includes(
+        error.code,
+      ))
+  )
+    return 3;
+  return 1;
+}

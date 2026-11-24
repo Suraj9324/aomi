@@ -1,0 +1,244 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
+
+import { GeneralSettings } from "@/account/general-settings";
+
+type FetchCall = {
+  input: string | URL | Request;
+  init?: RequestInit;
+};
+
+const widgetMock = vi.hoisted(() => ({
+  accountId: "",
+  getAccountCredential: vi.fn(async () => null),
+  connect: vi.fn(async () => undefined),
+  openAccountUI: vi.fn(async () => undefined),
+}));
+const runtimeMock = vi.hoisted(() => ({
+  creditsGet: vi.fn(),
+}));
+
+vi.mock("@aomi-labs/react", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@aomi-labs/react")>()),
+  cn: (...classes: unknown[]) => classes.filter(Boolean).join(" "),
+  getChainInfo: () => ({ ticker: "ETH" }),
+  useAomiRuntime: () => ({
+    account: {
+      credits: {
+        get: runtimeMock.creditsGet,
+      },
+    },
+  }),
+}));
+
+vi.mock("@/wallet/context", () => ({
+  useAomiWalletKit: () => ({
+    accountUser: { id: widgetMock.accountId, displayName: "Aron" },
+    accountWallets: [
+      {
+        id: "wallet-rabby",
+        family: "evm",
+        address: "0xabc",
+        label: "Rabby",
+        kind: "external",
+      },
+      {
+        id: "wallet-metamask",
+        family: "evm",
+        address: "0xdef",
+        label: "MetaMask",
+        kind: "external",
+      },
+    ],
+    accounts: [
+      {
+        id: "rabby",
+        family: "evm",
+        address: "0xabc",
+        walletName: "Rabby",
+        active: true,
+        linked: true,
+      },
+    ],
+    wallets: [
+      {
+        key: "evm:0xabc",
+        family: "evm",
+        address: "0xabc",
+        kind: "external",
+        walletName: "Rabby",
+        label: "Rabby",
+        connectionId: "rabby",
+        linkedWalletId: "wallet-rabby",
+        state: "ready",
+        connected: true,
+        linked: true,
+        operating: true,
+        actions: [],
+      },
+      {
+        key: "evm:0xdef",
+        family: "evm",
+        address: "0xdef",
+        kind: "external",
+        label: "MetaMask",
+        linkedWalletId: "wallet-metamask",
+        state: "offline",
+        reason: "disconnected",
+        connected: false,
+        linked: true,
+        operating: false,
+        actions: [],
+      },
+    ],
+    canConnect: true,
+    canOpenAccountUI: true,
+    connect: widgetMock.connect,
+    getAccountCredential: widgetMock.getAccountCredential,
+    identity: {
+      address: "0xabc",
+      authMethod: "wallet",
+      chainId: 1,
+      isConnected: true,
+      status: "connected",
+    },
+    openAccountUI: widgetMock.openAccountUI,
+  }),
+}));
+
+function requestUrl(input: FetchCall["input"]): URL {
+  if (input instanceof Request) return new URL(input.url);
+  return new URL(input.toString(), "https://portal.test");
+}
+
+function requestPaths(calls: FetchCall[]): string[] {
+  return calls.map((call) => requestUrl(call.input).pathname);
+}
+
+const ACCOUNT_OVERVIEW = {
+  user: {
+    apps: ["default"],
+    created_at: 1_700_000_000,
+    public_key: "0xabc",
+    status: "active",
+    tier: "pro",
+    updated_at: 1_700_000_100,
+    user_id: "acct-user-1",
+    verified_email: "alice@example.com",
+  },
+};
+
+function installFetchRecorder() {
+  const calls: FetchCall[] = [];
+  const fetchMock = vi.fn(
+    async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ input, init });
+      const url = requestUrl(input);
+      const method =
+        input instanceof Request ? input.method : (init?.method ?? "GET");
+
+      if (url.pathname === "/v1/account/credits/ledger")
+        return Response.json({ entries: [], next_before_id: null });
+      if (url.pathname === "/v1/account/credits") {
+        const position = await runtimeMock.creditsGet();
+        return Response.json(position);
+      }
+      if (url.pathname === "/api/account" && method === "GET") {
+        return Response.json(ACCOUNT_OVERVIEW);
+      }
+
+      return new Response(`Unexpected request: ${method} ${url.pathname}`, {
+        status: 500,
+      });
+    },
+  );
+
+  vi.stubGlobal("fetch", fetchMock);
+  return { calls, fetchMock };
+}
+
+let accountSequence = 0;
+describe("settings route callers", () => {
+  beforeEach(() => {
+    widgetMock.accountId = `settings-test-${++accountSequence}`;
+    widgetMock.getAccountCredential.mockClear();
+    runtimeMock.creditsGet.mockReset();
+    runtimeMock.creditsGet.mockResolvedValue({
+      period_utc_month: "2026-07",
+      included: {
+        limit_microusd: 100 * 10_000,
+        used_microusd: 12 * 10_000,
+        remaining_microusd: 88 * 10_000,
+      },
+      balance_microusd: 0,
+      reserved_microusd: 0,
+      available_microusd: 0,
+      debt_microusd: 0,
+      entries: [],
+      next_before_id: null,
+    });
+    localStorage.clear();
+    // jsdom has no matchMedia; useSettings consults it for the "auto" theme.
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn(() => ({
+        matches: false,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      })),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("loads the general account overview from the account route", async () => {
+    const { calls, fetchMock } = installFetchRecorder();
+
+    render(<GeneralSettings />);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(requestPaths(calls)).toContain("/api/account");
+    expect(requestPaths(calls)).not.toContain("/api/settings/account");
+  });
+
+  it("renders the summary card with plan and allowance in dollars", async () => {
+    installFetchRecorder();
+
+    render(<GeneralSettings />);
+
+    await waitFor(() => expect(screen.getByText("Aron")).toBeTruthy());
+    expect(
+      screen.getByText(/^2 linked wallets · 1 not connected on this device/),
+    ).toBeTruthy();
+    expect(screen.getByText("Pro plan")).toBeTruthy();
+    expect(screen.getByText(/of \$1\.00/)).toBeTruthy();
+    expect(
+      screen.getByRole("img", { name: "88% of monthly allowance left" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Billing" })).toBeTruthy();
+    expect(screen.queryByText(/Usage shows spend/)).toBeNull();
+  });
+
+  it("keeps General settings usable when credits omit the allowance", async () => {
+    runtimeMock.creditsGet.mockResolvedValue({
+      period_utc_month: "2026-07",
+      balance_microusd: 0,
+      reserved_microusd: 0,
+      available_microusd: 0,
+      debt_microusd: 0,
+      entries: [],
+      next_before_id: null,
+    });
+    installFetchRecorder();
+
+    render(<GeneralSettings />);
+
+    expect(await screen.findByText("Aron")).toBeTruthy();
+    expect(screen.getByText("Pro plan")).toBeTruthy();
+    expect(screen.getByText("Not on this plan")).toBeTruthy();
+    expect(screen.queryByRole("img", { name: /allowance left/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Billing" })).toBeTruthy();
+  });
+});

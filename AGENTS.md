@@ -1,0 +1,106 @@
+# Repository Guidelines
+
+## Project Structure & Module Organization
+
+Read [frontend invariants](docs/topics/development/facts/frontend-invariants.md)
+before changing public packages, examples, or CI. See
+[development workspace](docs/topics/development/facts/workspace.md) for the layout.
+`packages/client` owns the SDK; `packages/cli` owns the CLI; `packages/react` owns React runtime
+integration; `packages/widget` owns the published widget.
+`packages/account` owns shared authentication and BFF support. Deployed apps
+live under `apps/`, including Portal, Build, and Landing.
+
+Read `specs/DOMAIN.md` for architecture rules and `specs/METADATA.md` for layout and commands.
+
+## Documentation
+
+- Repo markdown holds durable knowledge only: facts pages in `docs/topics/<topic>/facts/`, package READMEs, skills and changesets.
+- A facts page states what is true of the code at this commit, in the present tense.
+- If a sentence can become false without a commit, it is state. Detail goes in the pull request or the issue. The one state file is `STATE.md`.
+- `STATE.md`: read it at the start of a session. Every line is `date · @owner · what · link`; the date is when the line was written or last confirmed, and only the owner edits or removes it. Rewrite it in place, never append history, and keep it under 60 lines. Remove a line when its work merges or closes; prune lines older than 14 days that nobody re-confirmed.
+- `docs/decisions.md`: one append-only line per durable decision, `date · @author · decision · link`.
+- Do not create any other plans, status reports, work logs, handoffs, audit results or scratch notes as markdown files. Do not add other top-level `.md` files or new docs folders.
+- When a change alters behavior, update the facts page in the same change. Delete a page that is wrong or obsolete; git history keeps it.
+
+## Build, Test, and Development Commands
+
+Use the repository-pinned pnpm version through Corepack. For Aomi local work,
+run heavyweight checks through the managed `aomi-dev exec --repo frontend`
+workflow for the selected workspace.
+
+- `pnpm run build:packages` — build/check shared packages.
+- `pnpm run lint` and `pnpm run typecheck` — workspace lint and library types.
+- `pnpm exec vitest run` — workspace automated tests.
+- `pnpm run test:portal` — app tests.
+- `pnpm run test:contracts -- --base <trusted-base-sha>` — build and pack the
+  candidate SDK, React runtime, and widget; validate existing consumers from
+  that base outside the workspace. CI supplies the PR base SHA automatically.
+- `pnpm run check:frontend-boundaries` — reject private cross-app UI imports
+  and package dependency-direction violations.
+- `pnpm run typecheck:apps` and `pnpm run build:apps` — deployed app checks.
+- `pnpm --filter portal dev` — run the Portal. `pnpm run test:journeys` — browser journeys (see `tests/e2e/README.md`).
+
+## Coding Style & Naming Conventions
+
+For widget UI icons, import Phosphor Regular from `@/icons/ui-icons`. Extend that catalog with an official Phosphor icon when needed. Do not generate or hand-draw interface SVGs.
+
+The codebase is TypeScript + React 19 on Next 16. Prefer functional components with explicit prop interfaces exported near the component. Follow Prettier defaults (2-space indent, double quotes, trailing commas) and rely on `clsx` + `class-variance-authority` for styling variants. File names use kebab-case (e.g., `aomi-frame.tsx`), component exports use PascalCase, and hooks use `use-*.ts`. Tests sit next to the code. Widget modules live in their frame, thread, composer, sidebar, controls, account, wallet, or UI feature. Tailwind utility strings should group layout → color → motion classes to minimize churn.
+
+## Testing Guidelines
+
+Vitest and Playwright suites already exist. Run the checks relevant to changed
+behavior and report what passed, failed, or was not exercised. For SDK/widget
+changes, run the consumer compatibility check against the trusted base before
+finishing. Never edit an existing consumer to conceal a compatibility failure;
+intentional migrations require frontend-owner review. Browser checks remain a
+separate layer and are not implied by a successful consumer build.
+Portal host composition must use `@aomi-labs/widget/host-composition`;
+do not add relative imports into `packages/widget/src` or use its internal
+`@/` aliases from Portal source.
+
+## Commit & Pull Request Guidelines
+
+Commits follow short, imperative summaries (`Fix linting ci`, `Update packages for …`). Keep bodies optional but include rationale when touching build or security-sensitive files. For pull requests, add: 1) a concise description of the change and linked issue, 2) a checklist of commands you ran (lint, build, demo), and 3) screenshots or short clips for UI-impacting work.
+
+Before merging, audit every touched workspace against the npm publish workflow. If shipped files from a publishable npm package changed, bump that package's version in the same change (use a patch bump unless the release scope requires otherwise), refresh any affected lockfile or generated artifacts, and verify the package is publishable. Client and React `dist/` trees are generated by their deterministic `prepack` hooks and must not be committed; audit the resulting tarballs instead. Do not defer required npm version bumps until after merge.
+
+## Security & Configuration Tips
+
+Never commit `.env` contents. Use the selected app's documented environment
+configuration and disposable test credentials. Keep provider secrets and
+identity verification on the server; consumer compatibility checks require no
+provider credentials or production accounts.
+
+## Secrets and env vars
+
+These rules exist because secrets set by hand were lost. The edge Worker's keys
+were set with `wrangler secret put`, their Vercel copies were Sensitive, and
+nobody could read any of them back.
+
+- **One root per secret.** A hosted secret has exactly one home, the matching
+  product-mono GitHub Environment (`staging`, `rc`, `production`). The deploy
+  pipeline pushes it to the Worker or app. Rotate it there, then redeploy.
+- **Never hand-set a secret.** Do not run `wrangler secret put` or add a
+  Sensitive Vercel value that exists nowhere else. A value with no stored
+  source cannot be recovered or rotated.
+- **Never one value in two stores.** If two stores must hold the same value,
+  that is a bug to remove. Until it is removed, document both names together
+  and rotate them together, such as the edge's `BUILD_SESSION_SECRET` and
+  the Build server's `BUILD_SESSION_SECRET`.
+- **Public halves are committed and verified.** A signing key's public half
+  lives in committed topology (`packages/service-identity/src/topologies.ts`). Commit it in the same change that
+  stores the private half. `pnpm --filter aomi-edge generate-key <env>` prints
+  both halves and the `gh secret set` command.
+- **Non-secrets are committed config. Constants are code.** A value that is the
+  same in every environment is a literal in code, not a var. A value that
+  differs per environment is committed inventory or a deploy `--var`.
+- **One name and one reader per var.** No `NEXT_PUBLIC_*` fallback on the
+  server, no alias chains such as `A ?? B ?? C`. Server code reads the server
+  name only. Browser code reads its own `NEXT_PUBLIC_` name only.
+- **Fail loud.** A missing required value throws on a hosted deployment.
+  Defaults are for local development or deliberately public endpoints only.
+- **Document every var once.** Each app's `.env.example`
+  (`apps/portal`, `apps/build`, `apps/landing`) and `apps/edge/.dev.vars.example`
+  list its real secrets and per-environment values. Add a var there in the
+  same change that adds its reader, and delete it in the change that deletes
+  the reader.

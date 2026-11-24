@@ -1,0 +1,93 @@
+# Aomi CLI
+
+The Aomi agent in your terminal. Install `@aomi-labs/cli` for the `aomi`
+command. It is a thin client of `new Aomi()` from `@aomi-labs/client`.
+
+```sh
+npm install -g @aomi-labs/cli
+aomi                                  # the chat screen
+aomi -p "swap 0.1 eth to usdc on base"  # ask once, print the answer
+aomi --help                           # every command
+```
+
+`aomi <command> --help` lists a command's flags; `--help-all` adds the hidden
+ones (`--backend-url`, `--api-key`, `--rpc-url`).
+
+## Sign in
+
+Two ways, nothing else:
+
+- `aomi login` shows a device code and opens the approval page. Pick the wallet
+  or provider there. One approval covers chat, Pipeline and account settings;
+  the grant refreshes silently and lives in `~/.aomi/grants.json`.
+  `aomi logout` revokes it.
+- `--private-key <hex>` (or `AOMI_PRIVATE_KEY`) signs in with SIWE using that
+  key, without a browser, and signs what the agent prepares. For bots.
+  `--solana-private-key <key>` (or `AOMI_SOLANA_PRIVATE_KEY`, base58 or a
+  `solana-keygen` JSON array) does the same with SIWS, on `--cluster`
+  (`mainnet`, `devnet` or `testnet`; default the signer's saved cluster, else
+  mainnet). `--rpc-url` serves that cluster when it signs.
+
+Without either you are a guest: chat and public reads work, and the guest's
+threads stay yours on this machine.
+
+## Output
+
+`aomi -p` writes the reply (and only the reply) to stdout. The trace goes to
+stderr, one line per step:
+
+```
+✓ Stage transaction     Base · 1 tx · Native transfer · Staged
+✓ Simulate transaction  Base · 1 tx
+◐ Commit transactions   Base · 1 tx · Awaiting approval
+
+Transfer is ready.
+
+Waiting for you  aomi tx approve 7f3c…
+https://aomi.chat/sign/7f3c…
+```
+
+`--json` makes stdout NDJSON: `step`, `reply` and `commit` events.
+
+Exit codes: 0 ok, 1 error, 2 usage, 3 waiting for an approval, a signature or a
+sign-in.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `chat [message]` | Ask once (`-p`) or open the chat screen. `--thread`, `--new`, `--app`, `--model` |
+| `threads` | `list`, `open <id>`, `new`, `rename <id> <title>`, `archive <id>` |
+| `login`, `logout`, `whoami` | Sign in and out |
+| `account` | Profile; `connections`, `unlink`, `credits`, `fund`, `statement` |
+| `wallets` | Agent wallets: `list`, `balance <id>`, `use <id>`; the local `signer` (`show`, `set`, `clear`) |
+| `policy` | Each agent wallet's policies and where they stand on chain; `catalog`, `set <json>` or `set --amt <amount> <asset> --to <app-id\|address>`, `remove <policy-id>`, `mode whitelist\|blacklist`, `authority self\|<address>`, `deploy <policy-id>` and `undeploy <policy-id>` (on chain, with the local signer), `approve <change-id>`, `decline <change-id>`. A `<policy-id>` may be the start of an id that only one policy has |
+| `tx` | `list`, `review <ref>`, `approve <ref>`, `reject <ref>`, `sign <ref>`, `export <ref>` |
+| `guard [strict\|balanced\|yolo]` | The thread's guard, or `--account`'s default |
+| `apps` | `list`, `install`, `uninstall`, `use`, `credentials` |
+| `pipeline` | `ops`, `op`, `apps`, `skills`, `skill`, `invoke`, `build [--commit]` |
+| `deploy` | Deploy the current commit; `status [--watch]`, `activate` |
+| `model`, `chain` | `current`, `list`, `set` |
+| `keys` | Your own provider keys: `list`, `set <provider>`, `remove` |
+| `secret` | `list`, `add NAME=value…`, `clear` |
+| `config` | `current`, `set-backend <url>` |
+| `completion` | `eval "$(aomi completion)"` |
+
+Credential and key values come from stdin or a hidden prompt, never argv.
+`--chain` takes a decimal chain id.
+
+## The chat screen
+
+`aomi` opens it. Each turn shows "Worked Ns · N steps" (ctrl+o expands the
+steps), the reply, and a box for a commit waiting for your approval: `a`
+approve, `r` reject, `o` open in the browser, `d` details. Type `/` for
+`/model` (a list, Auto first), `/guard` (Strict, Balanced or Yolo for the
+thread), `/new`, `/help`. Chat routes to every app (Auto); `--app` pins one
+for a run. Esc stops a turn; ctrl+c quits.
+
+## State
+
+Everything lives under `~/.aomi` (`AOMI_STATE_DIR` overrides it): `cli.json`
+(backend, thread, model, chain, local signer keys) and `grants.json`.
+`AOMI_BACKEND_URL` or `aomi config set-backend`
+point the CLI at another Aomi, e.g. `https://staging.aomi.chat`.

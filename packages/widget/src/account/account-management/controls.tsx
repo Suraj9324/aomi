@@ -1,0 +1,291 @@
+import { cn } from "@/lib/cn";
+import {
+  Check,
+  Copy,
+  Ellipsis,
+  Loader2,
+  Wallet,
+  type LucideIcon,
+} from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
+import { aomiButton } from "@/ui/aomi/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/ui/popover";
+import { WalletMark, resolveWalletBrandKey } from "@/wallet/wallet-brands";
+import { AomiMark } from "@/ui/aomi-mark";
+import { AGENT_WALLET } from "./wallet-model";
+
+/**
+ * A wallet app's mark. The dot says whether the address is usable here
+ * (green) or needs a step first (grey).
+ */
+export function BrandMark({
+  brand,
+  dot,
+  size = 17,
+  box = 32,
+  dim = false,
+}: {
+  brand: string;
+  dot?: "on" | "off";
+  /** Greyed out, e.g. a paused wallet. */
+  dim?: boolean;
+  size?: number;
+  box?: number;
+}) {
+  const agent = brand === AGENT_WALLET;
+  const key = agent ? null : resolveWalletBrandKey(brand);
+  return (
+    <span
+      className={cn(
+        "relative flex shrink-0 items-center justify-center",
+        dim && "[&>svg]:opacity-40",
+      )}
+      style={{ width: box, height: box }}
+      data-wallet-brand={agent ? "agent" : (key ?? undefined)}
+    >
+      {agent ? (
+        <AomiMark size={Math.max(12, size - 2)} className="text-aomi-fg" />
+      ) : key ? (
+        <WalletMark name={key} size={size} />
+      ) : (
+        <Wallet size={Math.min(size, 16)} className="text-aomi-muted" />
+      )}
+      {dot ? (
+        <span
+          aria-hidden
+          data-dot={dot}
+          className={cn(
+            "ring-aomi-raised absolute rounded-full ring-2",
+            dot === "on" ? "bg-aomi-success" : "bg-aomi-muted/60",
+          )}
+          style={{
+            width: Math.max(6, Math.round(box / 5)),
+            height: Math.max(6, Math.round(box / 5)),
+            right: Math.round((box - size) / 2) - 2,
+            bottom: Math.round((box - size) / 2) - 2,
+          }}
+        />
+      ) : null}
+    </span>
+  );
+}
+
+export function CopyButton({
+  value,
+  label,
+  className,
+}: {
+  value: string;
+  label: string;
+  className?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+  return (
+    <button
+      type="button"
+      aria-label={copied ? "Copied" : label}
+      title={value}
+      className={cn(
+        aomiButton({ variant: "ghost", size: "icon-sm" }),
+        className,
+      )}
+      onClick={(event) => {
+        event.stopPropagation();
+        void copyText(value).then(() => setCopied(true));
+      }}
+    >
+      {copied ? <Check size={14} /> : <Copy size={14} />}
+    </button>
+  );
+}
+
+export const copyText = (value: string) =>
+  navigator.clipboard.writeText(value).catch(() => undefined);
+
+export function TextButton({
+  children,
+  danger = false,
+  busy = false,
+  disabled = false,
+  onClick,
+}: {
+  children: ReactNode;
+  danger?: boolean;
+  busy?: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={busy || disabled}
+      onClick={onClick}
+      className={aomiButton({
+        variant: danger ? "danger" : "secondary",
+        size: "sm",
+      })}
+    >
+      {busy ? <Loader2 className="animate-spin" /> : null}
+      {children}
+    </button>
+  );
+}
+
+export type MenuItem = {
+  label: string;
+  icon: LucideIcon;
+  /** Destructive: drawn red, always last, after a divider. */
+  danger?: boolean;
+  onSelect?: () => unknown;
+};
+
+/**
+ * The ⋯ menu on a wallet, login or connection row: icon + label rows, with
+ * the destructive item last after a divider whatever order it was given in.
+ */
+export function ActionsMenu({
+  label,
+  items,
+  disabled = false,
+  busy = false,
+}: {
+  label: string;
+  items: MenuItem[];
+  disabled?: boolean;
+  busy?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const safe = items.filter((item) => !item.danger);
+  const danger = items.filter((item) => item.danger);
+  const row = (item: MenuItem) => {
+    const Icon = item.icon;
+    return (
+      <button
+        key={item.label}
+        type="button"
+        role="menuitem"
+        className={cn(
+          "aomi-menu-row flex min-h-[34px] w-full items-center gap-2.5 px-2.5 py-1.5 text-left text-[13px] font-medium leading-5 outline-none",
+          item.danger ? "text-aomi-danger" : "text-aomi-fg",
+        )}
+        onClick={() => {
+          setOpen(false);
+          void item.onSelect?.();
+        }}
+      >
+        <Icon
+          className={cn(
+            "size-4 shrink-0",
+            item.danger ? "text-aomi-danger" : "text-aomi-muted",
+          )}
+        />
+        {item.label}
+      </button>
+    );
+  };
+  return (
+    <Popover open={open && !disabled} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          aria-label={label}
+          aria-haspopup="menu"
+          disabled={disabled}
+          onClick={(event) => event.stopPropagation()}
+          className={aomiButton({ variant: "ghost", size: "icon-sm" })}
+        >
+          {busy ? (
+            <Loader2 className="animate-spin" />
+          ) : (
+            <Ellipsis className="size-4" />
+          )}
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        role="menu"
+        aria-label={label}
+        align="end"
+        sideOffset={5}
+        className="z-[90] space-y-1 w-max min-w-48 max-w-[calc(100vw-2rem)]"
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => {
+          if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key))
+            return;
+          event.preventDefault();
+          const nodes = Array.from(
+            event.currentTarget.querySelectorAll<HTMLElement>(
+              '[role="menuitem"]',
+            ),
+          );
+          const current = nodes.indexOf(document.activeElement as HTMLElement);
+          const next =
+            event.key === "Home"
+              ? 0
+              : event.key === "End"
+                ? nodes.length - 1
+                : (current +
+                    (event.key === "ArrowDown" ? 1 : -1) +
+                    nodes.length) %
+                  nodes.length;
+          nodes[next]?.focus();
+        }}
+      >
+        {safe.map(row)}
+        {safe.length && danger.length ? (
+          <div role="separator" className="bg-aomi-border mx-1 my-1 h-px" />
+        ) : null}
+        {danger.map(row)}
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/**
+ * A top-level row's left edge. Every logo box starts at 22px; a row that
+ * expands draws its chevron in that gutter, its box against the logo's. The
+ * gaps you see then match: 8px + the chevron's own 5px before it, its 5px +
+ * the 17px logo's 7.5px inset in its 32px box after it (about 13px each).
+ */
+export const rowStart = (expands: boolean) => (expands ? "pl-2" : "pl-[22px]");
+
+export function titleCase(value: string): string {
+  return value
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+/**
+ * A section band inside the wallets card, with an optional action at its end.
+ * Its text lines up with the logos you see (a 22px box, 7.5px inset).
+ */
+export function Divider({
+  title,
+  detail,
+  action,
+}: {
+  title: string;
+  detail: string;
+  action?: ReactNode;
+}) {
+  return (
+    <div
+      data-band
+      className="aomi-table-band border-aomi-border flex items-baseline gap-2 border-y [padding:var(--aomi-band-padding)]"
+    >
+      <span className="type-meta shrink-0 font-medium">
+        {title}
+      </span>
+      <span className="type-meta min-w-0 truncate">
+        {detail}
+      </span>
+      {action ? (
+        <span className="-my-1.5 ml-auto self-center">{action}</span>
+      ) : null}
+    </div>
+  );
+}

@@ -1,0 +1,325 @@
+import type { components } from "../generated/agent-v1/types";
+import type { TransactionSafetyMode } from "../transaction-safety";
+import type { CommitView } from "../commits";
+import type { Action, ActionRequest } from "../agent/types";
+
+type Schemas = components["schemas"];
+
+/** JSON Schema as returned by the live Pipeline Catalog. */
+export type PipelineJsonSchema = boolean | Record<string, unknown>;
+
+export type PipelineDirectoryEntryKind = "directory" | "operation" | "document";
+
+export interface PipelineDirectoryEntry {
+  name: string;
+  kind: PipelineDirectoryEntryKind;
+  href: string;
+  description?: string;
+}
+export interface PipelineDirectory {
+  kind: "directory";
+  path: string;
+  entries: PipelineDirectoryEntry[];
+}
+
+export interface PipelineOperationDescriptor {
+  kind: "operation";
+  name: string;
+  description: string;
+  method: "POST";
+  href: string;
+  inputSchema: PipelineJsonSchema;
+  outputSchema?: PipelineJsonSchema;
+  chainFamily?: "evm" | "svm";
+}
+
+export interface PipelineDocument {
+  kind: "document";
+  name: string;
+  href: string;
+  mediaType: string;
+  content: string;
+}
+
+export type PipelineFilesystemResource =
+  | PipelineDirectory
+  | PipelineOperationDescriptor
+  | PipelineDocument;
+
+export interface PipelineOperationInvocation<
+  Arguments extends Record<string, unknown> = Record<string, unknown>,
+> {
+  operation: string;
+  arguments: Arguments;
+}
+
+export interface PipelineExecutionScope {
+  /** Preparation policy, EVM and Solana. An explicit value overrides; when
+   * omitted, the backend uses the thread's saved policy, else the account
+   * default. */
+  transactionSafetyMode?: TransactionSafetyMode;
+  app?: string;
+  skills?: string[];
+}
+
+export type PipelineOperationBuildInput<
+  Arguments extends Record<string, unknown> = Record<string, unknown>,
+> = PipelineExecutionScope &
+  (
+    | PipelineOperationInvocation<Arguments>
+    | { operations: PipelineOperationInvocation<Arguments>[] }
+  );
+
+export interface PipelineBuildOrigin {
+  app: string;
+  skills?: string[];
+  operations: PipelineOperationInvocation[];
+}
+
+/** @deprecated Use PipelineBuildOrigin. */
+export type PipelineBuildProvenance = PipelineBuildOrigin;
+
+export interface PipelineMutationOptions {
+  /** Request-boundary override; later omission inherits the sealed Build mode. */
+  transactionSafetyMode?: TransactionSafetyMode;
+  idempotencyKey?: string;
+  paymentSignature?: string;
+}
+
+export interface PipelineInvokeOptions extends PipelineMutationOptions {
+  /** Validate arguments against the live operation descriptor before POSTing. */
+  validate?: boolean;
+}
+
+export interface PipelineCommitOptions extends PipelineMutationOptions {
+  /** Defaults to the portable Build digest, making repeated commits stable. */
+  idempotencyKey?: string;
+}
+
+export type PipelineSimulation = Schemas["PipelineSimulation"];
+export type PipelineSimulationStatus = PipelineSimulation["status"];
+export type PipelineBalanceChange = Schemas["PipelineBalanceChange"];
+export type PipelineAssetStandard = NonNullable<
+  PipelineBalanceChange["standard"]
+>;
+export type PipelineApprovalChange = Schemas["PipelineApprovalChange"];
+export type PipelineApprovalKind = PipelineApprovalChange["kind"];
+export type PipelineFeeEstimate = Schemas["PipelineFeeEstimate"];
+export type PipelineGuardResult = Schemas["PipelineGuardResult"];
+export type PipelineGasEstimate = Schemas["PipelineGasEstimate"];
+export type PipelineLog = Schemas["PipelineLog"];
+
+/** Server-authored Build summary. The wire schema leaves it open, so this is a
+ * structural view of the fields the server emits today; unknown fields pass
+ * through untouched. */
+export interface PipelineActionSummary {
+  title?: string;
+  description?: string;
+  actionCount?: number;
+  transactionCount?: number;
+  assetsIn?: PipelineBalanceChange[] | string[];
+  assetsOut?: PipelineBalanceChange[] | string[];
+  contracts?: string[];
+  programs?: string[];
+  chains?: Array<number | string>;
+  [key: string]: unknown;
+}
+
+export interface EvmCallInput {
+  to: `0x${string}`;
+  data?: `0x${string}`;
+  /** bigint is accepted at the SDK boundary and encoded as a decimal string. */
+  value?: bigint | string;
+  gas?: bigint | string;
+  description?: string;
+}
+
+export interface EvmCall extends Omit<EvmCallInput, "value" | "gas"> {
+  value?: string;
+  gas?: string;
+}
+
+/** Canonical evm_stage_tx arguments, carried unchanged by the raw transport. */
+export interface EvmStageActionInput {
+  to: string;
+  description: string;
+  data: { signature: string; args: string[]; raw: string };
+  chain_id?: number;
+  value?: bigint | string;
+  gas_limit?: bigint | string;
+  expires_at?: number;
+  kind?: string;
+  protocol?: string;
+  routed_plan_id?: string;
+}
+
+export interface EvmStageInput extends PipelineExecutionScope {
+  actions: EvmStageActionInput[];
+}
+
+/** Fluent call input; the SDK converts each call to evm_stage_tx arguments. */
+export interface EvmDirectInput extends PipelineExecutionScope {
+  chainId: number;
+  calls: EvmCallInput[];
+  description?: string;
+}
+
+export type EvmStagedAction = Schemas["AssembledEvmTransaction"];
+export type EvmPresentedAction = EvmStagedAction & { chainFamily: "evm" };
+
+export interface EvmStagedBuild {
+  /** Server-authored guard receipts sealed into the Build; preserve unchanged. */
+  readonly guardEvidence?: Record<string, unknown>;
+  transactionSafetyMode?: TransactionSafetyMode;
+  version: 2;
+  status: "staged";
+  actions: EvmStagedAction[];
+  origin: PipelineBuildOrigin;
+  expiresAt: number;
+  digest: string;
+  attestation: string;
+}
+
+export interface EvmSimulatedBuild {
+  /** Server-authored guard receipts sealed into the Build; preserve unchanged. */
+  readonly guardEvidence?: Record<string, unknown>;
+  transactionSafetyMode?: TransactionSafetyMode;
+  version: 2;
+  status: "simulated";
+  actions: EvmStagedAction[];
+  origin: PipelineBuildOrigin;
+  simulation: PipelineSimulation;
+  summary?: PipelineActionSummary;
+  expiresAt: number;
+  digest: string;
+  attestation: string;
+}
+
+export interface EvmCommitResult {
+  family: "evm";
+  status: "committed";
+  /** Explicit preparation outcome; status retains its legacy value for compatibility. */
+  preparation_status?: "prepared";
+  /** This preparation call does not invoke the provider; CommitViews retain actual lifecycle state. */
+  provider_invoked?: false;
+  next_required_action?: "submit_wallet_request" | "continue_commit_cohort";
+  digest: string;
+  /** Legacy output slot; use the preparation fields to decide the next action. */
+  result: unknown;
+  /** Server-owned durable requests. Continue through Commit Service. */
+  requests: ActionRequest[];
+  thread_id?: string;
+  actions?: Action[];
+  commits?: CommitView[];
+}
+
+export type SvmAccountMeta =
+  Schemas["AssembledSvmInstruction"]["accounts"][number];
+
+export type SvmInstruction = {
+  program_id: string;
+  accounts?: SvmAccountMeta[];
+  description?: string;
+  kind?: string;
+} & (
+  | { data_base64: string; encode?: never }
+  | {
+      data_base64?: never;
+      encode: {
+        instruction: string;
+        /** JSON-encoded semantic argument object. */
+        args?: string;
+        /** JSON-encoded account-name to public-key mapping. */
+        account_pubkeys?: string;
+      };
+    }
+);
+
+/** One invocation of svm_stage_ix. Each instruction receives its own record. */
+export interface SvmInstructionBatch {
+  instructions: SvmInstruction[];
+  description: string;
+  kind?: string;
+  version?: "legacy" | "v0";
+  address_lookup_tables?: string[];
+  compute_units?: number;
+  priority_microlamports?: number;
+  broadcaster?: "wallet" | "venue" | "hosted";
+  commitment?: string;
+}
+
+/** Canonical svm_stage_tx arguments for a venue-supplied base64 transaction. */
+export interface SvmTransaction {
+  tx: string;
+  description?: string;
+  kind?: string;
+  preserve_blockhash?: boolean;
+  broadcaster?: "wallet" | "venue" | "hosted";
+}
+
+export type SvmStageInput = PipelineExecutionScope &
+  (
+    | { kind: "instructions"; instructions: SvmInstructionBatch[] }
+    | { kind: "transaction"; transaction: SvmTransaction }
+  );
+
+export type SvmDirectInput = SvmStageInput;
+
+export type SvmAssembledAccountMeta = SvmAccountMeta;
+export type AssembledSvmInstruction = Schemas["AssembledSvmInstruction"];
+
+export type SvmStagedAction =
+  | {
+      lane: "instruction";
+      id: number;
+      instruction: Schemas["AssembledSvmInstruction"];
+    }
+  | {
+      lane: "transaction";
+      id: number;
+      transaction: Schemas["AssembledSvmTransaction"];
+    };
+
+export type SvmBuildAction = SvmStagedAction;
+export type SvmPresentedAction = SvmStagedAction & { chainFamily: "svm" };
+
+export interface SvmStagedBuild {
+  transactionSafetyMode?: TransactionSafetyMode;
+  version: 2;
+  status: "staged";
+  actions: SvmStagedAction[];
+  origin: PipelineBuildOrigin;
+  expiresAt: number;
+  digest: string;
+  attestation: string;
+}
+
+export interface SvmSimulatedBuild {
+  transactionSafetyMode?: TransactionSafetyMode;
+  version: 2;
+  status: "simulated";
+  actions: SvmStagedAction[];
+  origin: PipelineBuildOrigin;
+  simulation: PipelineSimulation;
+  summary?: PipelineActionSummary;
+  expiresAt: number;
+  digest: string;
+  attestation: string;
+}
+
+export interface SvmCommitResult {
+  family: "svm";
+  status: "committed";
+  /** Explicit preparation outcome; status retains its legacy value for compatibility. */
+  preparation_status?: "prepared";
+  provider_invoked?: false;
+  next_required_action?: "submit_wallet_request";
+  digest: string;
+  /** The commit operation's result: what was committed and where it is signed. */
+  result: unknown;
+  /** The thread that owns the commits. */
+  thread_id: string;
+  /** Commit Service commits, in order. Sign and follow them like any commit. */
+  commits: CommitView[];
+}
+export type PipelineErrorBody = Schemas["ErrorEnvelope"];

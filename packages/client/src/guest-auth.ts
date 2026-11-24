@@ -1,0 +1,297 @@
+import { AomiApiError } from "./api-error";
+
+export type GuestSessionProvider = ((options?: {
+  forceRefresh?: boolean;
+}) => Promise<string | null>) & {
+  clear(): void;
+  /** Prepare on user interaction; background reads do not create a guest. */
+  prepare?: () => Promise<void>;
+  /** The anonymous user the server confirmed; chats remember which guest started them. */
+  getIdentity?: () => string | null;
+};
+
+const FAILED_ATTEMPT_HOLD_MS = 2_000;
+
+/**
+ * Guest sign-in failed, so the request it was authorizing was never sent.
+ * A 429 has `code: "guest_rate_limited"` and the server's Retry-After.
+ */
+export class GuestSignInError extends AomiApiError {
+  override name = "GuestSignInError";
+  /** Seconds the server asked to wait before signing in again. */
+  readonly retryAfterSeconds?: number;
+
+  constructor(response: Response, message: string) {
+    super(
+      response.status,
+      response.status === 429 ? "guest_rate_limited" : "guest_sign_in_failed",
+      message,
+    );
+    // Retry-After is delta seconds or an HTTP date.
+    const header = response.headers.get("retry-after")?.trim();
+    const seconds = !header
+      ? NaN
+      : /^\d+$/.test(header)
+        ? Number(header)
+        : Math.ceil((Date.parse(header) - Date.now()) / 1000);
+    if (Number.isFinite(seconds)) this.retryAfterSeconds = Math.max(0, seconds);
+  }
+}
+
+let browserSessionTransition = Promise.resolve();
+
+/**
+ * Serialize browser operations that replace the same-origin Better Auth
+ * cookie. Without this queue, a guest bootstrap that started just before a
+ * wallet sign-in can finish last and overwrite the newly authenticated
+ * session with an anonymous one.
+ */
+export async function withBrowserSessionTransition<T>(
+  transition: () => Promise<T>,
+): Promise<T> {
+  const previous = browserSessionTransition;
+  let release!: () => void;
+  browserSessionTransition = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await transition();
+  } finally {
+    release();
+  }
+}
+
+export function createGuestSessionProvider(input: {
+  baseUrl: string;
+  fetch?: typeof fetch;
+  /** Whether the host already confirmed a cookie session; the backend still checks every request. */
+  getCookieSessionAvailable?: () => boolean;
+}): GuestSessionProvider {
+  const fetchImpl = input.fetch ?? globalThis.fetch.bind(globalThis);
+  const browser = typeof location !== "undefined";
+  const crossOriginBrowser = isCrossOriginBrowser(input.baseUrl);
+  const runtime = crossOriginBrowser
+    ? "cross-origin-browser"
+    : browser
+      ? "same-origin-browser"
+      : "server";
+  let credential: string | null | undefined;
+  let identity: string | null = null;
+  let pending: Promise<string | null> | null = null;
+  // A failed attempt stays the answer for a moment, so typing in the composer
+  // while the session check fails does not send a request per keystroke.
+  const acquire = (request: () => Promise<string | null>) => {
+    if (pending) return pending;
+    const attempt = request().then((next) => {
+      credential = next;
+      return next;
+    });
+    pending = attempt;
+    const settle = () => {
+      if (pending === attempt) pending = null;
+    };
+    attempt.then(settle, () => setTimeout(settle, FAILED_ATTEMPT_HOLD_MS));
+    return attempt;
+  };
+  const provider = async (options?: { forceRefresh?: boolean }) => {
+    if (pending) return pending;
+    if (options?.forceRefresh) credential = undefined;
+    if (credential !== undefined) return credential;
+    // Same-origin requests already carry the Better Auth cookie. Try it before
+    // creating an anonymous account so a signed-in user is never replaced by a
+    // guest merely because the Agent client initialized.
+    if (runtime === "same-origin-browser" && !options?.forceRefresh) {
+      return null;
+    }
+    return acquire(() =>
+      signInAnonymous(fetchImpl, input.baseUrl, runtime, (next) => {
+        identity = next;
+      }),
+    );
+  };
+  return Object.assign(provider, {
+    async prepare() {
+      if (pending) {
+        await pending;
+        return;
+      }
+      if (credential !== undefined) return;
+      if (runtime !== "same-origin-browser") {
+        await provider();
+        return;
+      }
+      await acquire(() =>
+        withBrowserSessionTransition(async () => {
+          if (input.getCookieSessionAvailable?.()) return null;
+          const response = await fetchImpl(
+            `${input.baseUrl.replace(/\/+$/, "")}/api/auth/get-session`,
+            {
+              credentials: "include",
+              cache: "no-store",
+              headers: { accept: "application/json" },
+            },
+          );
+          if (!response.ok)
+            throw new GuestSignInError(
+              response,
+              `Aomi session check failed with HTTP ${response.status}`,
+            );
+          const session: unknown = await response.json();
+          if (session !== null) {
+            if (
+              typeof session !== "object" ||
+              !("user" in session) ||
+              !("session" in session) ||
+              !session.session ||
+              !stringProperty(session.user, "id")
+            )
+              throw new Error("Aomi session check returned an invalid session");
+            const user = session.user;
+            identity =
+              user &&
+              typeof user === "object" &&
+              "isAnonymous" in user &&
+              user.isAnonymous === true
+                ? stringProperty(user, "id")
+                : null;
+            return null;
+          }
+          return requestAnonymousSession(
+            fetchImpl,
+            input.baseUrl,
+            runtime,
+            (next) => {
+              identity = next;
+            },
+          );
+        }),
+      );
+    },
+    clear() {
+      credential = undefined;
+      identity = null;
+    },
+    getIdentity: () => identity,
+  });
+}
+
+function isCrossOriginBrowser(baseUrl: string): boolean {
+  if (typeof location === "undefined") return false;
+  return new URL(baseUrl, location.origin).origin !== location.origin;
+}
+
+async function signInAnonymous(
+  fetchImpl: typeof fetch,
+  baseUrl: string,
+  runtime: "cross-origin-browser" | "same-origin-browser" | "server",
+  onIdentity?: (identity: string | null) => void,
+) {
+  if (runtime === "same-origin-browser") {
+    return withBrowserSessionTransition(() =>
+      requestAnonymousSession(fetchImpl, baseUrl, runtime, onIdentity),
+    );
+  }
+  return requestAnonymousSession(fetchImpl, baseUrl, runtime, onIdentity);
+}
+
+async function requestAnonymousSession(
+  fetchImpl: typeof fetch,
+  baseUrl: string,
+  runtime: "cross-origin-browser" | "same-origin-browser" | "server",
+  onIdentity?: (identity: string | null) => void,
+) {
+  const normalizedBase = baseUrl.replace(/\/+$/, "");
+  // One guest route: on the portal's own origin it sets the session cookie,
+  // from a server it returns that session's bearer, and for an embed on
+  // another site an origin-bound widget session.
+  const authPath = "/api/auth/guest";
+  const response = await fetchImpl(`${normalizedBase}${authPath}`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+    },
+    body: "{}",
+    credentials: runtime === "same-origin-browser" ? "include" : "omit",
+  });
+  if (
+    response.status === 409 &&
+    (await responseCode(response)) === "session_exists"
+  ) {
+    return null;
+  }
+  // Better Auth refuses a second anonymous sign-in while an anonymous
+  // session cookie is live. That cookie IS a working credential — fall back
+  // to it instead of failing the caller's request.
+  if (
+    response.status === 400 &&
+    (await responseCode(response)) ===
+      "ANONYMOUS_USERS_CANNOT_SIGN_IN_AGAIN_ANONYMOUSLY"
+  ) {
+    return null;
+  }
+  if (!response.ok) {
+    throw guestConnectionError(response, baseUrl, authPath);
+  }
+  const body = await response.json().catch(() => null);
+  if (runtime !== "server") onIdentity?.(stringProperty(body?.user, "id"));
+  if (runtime === "same-origin-browser") return null;
+  const token =
+    stringProperty(body, "access_token") ??
+    stringProperty(body, "token") ??
+    response.headers.get("set-auth-token");
+  if (!token) throw new Error("Aomi guest sign-in returned no bearer session");
+  return token;
+}
+
+function guestConnectionError(
+  response: Response,
+  baseUrl: string,
+  authPath: string,
+) {
+  const status = response.status;
+  // Report only the origin and our fixed route, never URL credentials, custom
+  // path segments, query strings, response bodies or authentication headers.
+  let origin = "the configured origin";
+  try {
+    origin = new URL(
+      baseUrl,
+      typeof location === "undefined" ? undefined : location.origin,
+    ).origin;
+  } catch {
+    // A custom fetch can accept a base URL the URL parser does not recognize.
+  }
+  const message = `Aomi guest sign-in failed with HTTP ${status} at ${origin} (${authPath}).`;
+  if (status !== 404) return new GuestSignInError(response, message);
+  const portal =
+    origin === "https://api.aomi.dev"
+      ? "https://aomi.chat"
+      : origin === "https://api-staging.aomi.dev"
+        ? "https://staging.aomi.chat"
+        : null;
+  return new GuestSignInError(
+    response,
+    portal
+      ? `${message} This is a backend origin; guest sign-in requires the Portal origin at ${portal}. Check baseUrl.`
+      : `${message} Check that baseUrl points to the Portal origin.`,
+  );
+}
+
+function stringProperty(value: unknown, property: string): string | null {
+  if (!value || typeof value !== "object" || !(property in value)) return null;
+  const candidate = (value as Record<string, unknown>)[property];
+  return typeof candidate === "string" && candidate ? candidate : null;
+}
+
+async function responseCode(response: Response) {
+  return response
+    .clone()
+    .json()
+    .then((body: unknown) =>
+      body && typeof body === "object" && "code" in body
+        ? String(body.code)
+        : null,
+    )
+    .catch(() => null);
+}

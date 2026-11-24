@@ -1,0 +1,307 @@
+// Usage page: builder-facing revenue-share statement (gross / platform fee /
+// net + charges) when the backend emits `statement`; falls back to the
+// legacy token/credits meter until then. End-user spend stays in Chat billing.
+
+import { UrlLink as Link } from "@/components/url-link";
+import {
+  signedUsdLabel,
+  statementPeriodLabel,
+  subjectLabel,
+  tokensLabel,
+  usdLabel,
+} from "./format";
+import { PartnerPayments } from "./partner-payments";
+import { Card, TD, TH } from "./table";
+
+type Row = Record<string, any>;
+
+function Statement({
+  statement,
+  breakdown,
+}: {
+  statement: Row;
+  breakdown: Row[];
+}) {
+  const summary = statement.summary;
+  const revenue: Row[] = statement.revenue ?? [];
+  const charges: Row[] = statement.charges ?? [];
+  const entries: Row[] = statement.entries ?? [];
+  const period = statementPeriodLabel(statement.range);
+  return (
+    <div className="space-y-[var(--aomi-section-gap)]">
+      <p className="build-caption leading-5">
+        Revenue, platform fees, and charges for your apps in this statement
+        period. End-user spend is reported separately under{" "}
+        <Link
+          href="/settings/billing"
+          className="text-foreground hover:underline"
+        >
+          Account → Billing
+        </Link>
+        .
+      </p>
+
+      {summary ? (
+        <div className="grid gap-3 min-[400px]:grid-cols-2 lg:grid-cols-4">
+          {[
+            {
+              label: "Gross revenue",
+              value: usdLabel(summary.grossRevenue),
+              sub: "collected from end users",
+            },
+            {
+              label: "Platform fees",
+              value: usdLabel(-Math.abs(summary.platformFees)),
+              sub: "revenue share",
+            },
+            {
+              label: "Service charges",
+              value: usdLabel(-Math.abs(summary.serviceCharges)),
+              sub: "model usage & hosting",
+            },
+            {
+              label: "Net",
+              value: signedUsdLabel(summary.net),
+              sub: period,
+            },
+          ].map((tile) => (
+            <div
+              key={tile.label}
+              className="border-border bg-surface build-row-padding min-w-0 [overflow-wrap:anywhere] space-y-[var(--aomi-caption-gap)] rounded-build-panel border"
+            >
+              <div className="build-caption">{tile.label}</div>
+              <div
+                className="build-page-title tabular-nums"
+              >
+                {tile.value}
+              </div>
+              <div className="build-caption">{tile.sub}</div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {statement.payments ? (
+        <PartnerPayments payments={statement.payments} period={period} />
+      ) : null}
+
+      <Card
+        title="Revenue"
+        right={
+          period ? <span className="build-caption">{period}</span> : null
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="divide-border min-w-full divide-y text-sm">
+            <thead className="build-table-band">
+              <tr>
+                <th className={TH}>Subject</th>
+                <th className={TH}>App</th>
+                <th className={TH}>Events</th>
+                <th className={TH}>Gross</th>
+                <th className={TH}>Platform fee</th>
+                <th className={TH}>Net</th>
+              </tr>
+            </thead>
+            <tbody className="divide-border divide-y">
+              {revenue.map((row, i) => (
+                <tr key={i} className={row.gross === 0 ? "text-dim" : ""}>
+                  <td className={`${TD} font-medium`}>
+                    {subjectLabel(row.subject)}
+                  </td>
+                  <td className={TD}>{row.application}</td>
+                  <td className={`${TD} text-xs`}>{row.events}</td>
+                  <td className={`${TD} tabular-nums text-sm`}>
+                    {usdLabel(row.gross)}
+                  </td>
+                  <td className={`${TD} tabular-nums text-sm`}>
+                    {usdLabel(row.platformFee)}
+                  </td>
+                  <td className={`${TD} tabular-nums text-sm font-semibold`}>
+                    {usdLabel(row.net)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      <div className="grid items-start gap-[var(--aomi-section-gap)] xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+        <Card title="Charges">
+          <div className="overflow-x-auto">
+            <table className="divide-border min-w-full divide-y text-sm">
+              <thead className="build-table-band">
+                <tr>
+                  <th className={TH}>Item</th>
+                  <th className={TH}>App</th>
+                  <th className={TH}>Events</th>
+                  <th className={TH}>Amount</th>
+                </tr>
+              </thead>
+              <tbody className="divide-border divide-y">
+                {charges.map((row, i) => (
+                  <tr key={i}>
+                    <td className={TD}>{subjectLabel(row.item)}</td>
+                    <td className={TD}>{row.application}</td>
+                    <td className={`${TD} build-caption`}>{row.events}</td>
+                    <td className={`${TD} tabular-nums text-sm`}>
+                      {usdLabel(row.amount)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+
+        <Card
+          title="Model usage detail"
+          right={<span className="build-caption">by provider/model</span>}
+        >
+          <div className="build-row-padding">
+            <div className="space-y-2">
+              {breakdown.map((row, index) => (
+                <div
+                  key={`${row.provider}-${row.model}-${index}`}
+                  className="flex items-center justify-between gap-3 text-sm"
+                >
+                  <span className="min-w-0 truncate font-mono text-sm">
+                    {row.provider}/{row.model}
+                  </span>
+                  <span className="text-dim tabular-nums text-sm">
+                    {Number(row.creditsUsed ?? 0).toFixed(4)}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <p className="text-dim mt-2 text-xs leading-4">
+              Token-level usage explains the base cost. Apps using
+              customer-provided keys (BYOK) incur no model charges.
+            </p>
+          </div>
+        </Card>
+      </div>
+
+      <Card title="Entries">
+        <div className="overflow-x-auto">
+          <table className="divide-border min-w-full divide-y text-sm">
+            <thead className="build-table-band">
+              <tr>
+                <th className={TH}>Day</th>
+                <th className={TH}>App</th>
+                <th className={TH}>Subject</th>
+                <th className={TH}>Events</th>
+                <th className={TH}>Gross</th>
+                <th className={TH}>Platform fee</th>
+                <th className={TH}>Net</th>
+              </tr>
+            </thead>
+            <tbody className="divide-border divide-y">
+              {entries.map((row, i) => (
+                <tr key={i}>
+                  <td className={`${TD} text-dim whitespace-nowrap`}>
+                    {row.day}
+                  </td>
+                  <td className={TD}>{row.application}</td>
+                  <td className={`${TD} text-xs`}>
+                    {subjectLabel(row.subject)}
+                  </td>
+                  <td className={`${TD} text-xs`}>{row.events}</td>
+                  <td className={`${TD} tabular-nums text-sm`}>
+                    {usdLabel(row.gross)}
+                  </td>
+                  <td className={`${TD} tabular-nums text-sm`}>
+                    {usdLabel(row.platformFee)}
+                  </td>
+                  <td className={`${TD} tabular-nums text-sm font-semibold`}>
+                    {signedUsdLabel(row.net)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/** Legacy token/credits meter — shown until statement billing ships. */
+function Meter({ daily, breakdown }: { daily: Row[]; breakdown: Row[] }) {
+  return (
+    <div className="space-y-3">
+      <p className="build-caption leading-5">
+        Model and token credits by app and day.{" "}
+        <Link
+          href="/settings/billing"
+          className="text-foreground hover:underline"
+        >
+          Account → Billing
+        </Link>{" "}
+        covers payment setup in Chat.
+      </p>
+      <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
+        <div className="build-table-frame">
+          <table className="divide-border min-w-full divide-y text-sm">
+            <thead className="build-table-band text-left text-sm">
+              <tr>
+                <th className={TH}>Day</th>
+                <th className={TH}>App</th>
+                <th className={TH}>Input</th>
+                <th className={TH}>Output</th>
+                <th className={TH}>Credits</th>
+              </tr>
+            </thead>
+            <tbody className="divide-border bg-surface divide-y">
+              {daily.map((row, index) => (
+                <tr
+                  key={`${row.project?.id}-${row.periodUtcDay}-${row.application}-${index}`}
+                >
+                  <td className="build-row-padding">{row.periodUtcDay}</td>
+                  <td className="build-row-padding">{row.application}</td>
+                  <td className="build-row-padding tabular-nums text-sm">
+                    {tokensLabel(row.inputTokens)}
+                  </td>
+                  <td className="build-row-padding tabular-nums text-sm">
+                    {tokensLabel(row.outputTokens)}
+                  </td>
+                  <td className="build-row-padding tabular-nums text-sm">
+                    {Number(row.creditsUsed ?? 0).toFixed(4)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="border-border bg-surface rounded-build-panel border p-3">
+          <div className="text-dim mb-2 text-xs uppercase">Breakdown</div>
+          <div className="space-y-2">
+            {breakdown.map((row, index) => (
+              <div
+                key={`${row.project?.id}-${row.provider}-${row.model}-${index}`}
+                className="flex items-center justify-between gap-3 text-sm"
+              >
+                <span className="min-w-0 truncate">
+                  {row.provider}/{row.model}
+                </span>
+                <span className="text-dim">
+                  {Number(row.creditsUsed ?? 0).toFixed(4)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function UsageRows({ payload }: { payload: Row }) {
+  const daily: Row[] = payload.daily ?? [];
+  const breakdown: Row[] = payload.breakdown ?? [];
+  if (payload.statement) {
+    return <Statement statement={payload.statement} breakdown={breakdown} />;
+  }
+  return <Meter daily={daily} breakdown={breakdown} />;
+}

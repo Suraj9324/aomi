@@ -1,0 +1,1091 @@
+import { AomiApiError, AomiError } from "./api-error";
+import { SimulationApiError } from "./simulation";
+import { ROUTE_SCOPES } from "./generated/route-scopes";
+import type {
+  AomiAccountProfile,
+  AomiAccountResponse,
+  AomiAppDescriptor,
+  AomiClientOptions,
+  AomiClearAppSecretsResponse,
+  AomiClearSecretsResponse,
+  AomiDeleteSecretResponse,
+  AomiIngestSecretsResponse,
+  AomiListSecretsResponse,
+  AomiRequestOptions,
+  AomiAccountAppMutationResponse,
+  AomiSimulateResponse,
+  AomiUserAppSecrets,
+  GetAccountBearer,
+  Logger,
+  AomiHttpMethod,
+  AomiPlatformFilter,
+  ApplicationId,
+} from "./types";
+import { normalizeAppDescriptor } from "./app-descriptor";
+import { UserState } from "./user-state";
+import { AgentApiError, AgentTransport } from "./agent/transport";
+import { PipelineTransport } from "./pipeline/transport";
+import { TransactionSafetyTransport } from "./transaction-safety";
+import { AccountTransport } from "./account/credits";
+import type {
+  AomiOAuthTokenProvider,
+  AomiOAuthResource,
+} from "./authorization";
+import {
+  createGuestSessionProvider,
+  type GuestSessionProvider,
+} from "./guest-auth";
+import { wrapFetchWithPaymentChallenges } from "./payment";
+
+// =============================================================================
+// Internal helpers
+// =============================================================================
+
+const SESSION_ID_HEADER = "X-Session-Id";
+// Non-Agent control endpoints still identify their owning session with both
+// headers. Agent v1 carries the session id in its resource path.
+const THREAD_ID_HEADER = "X-Thread-Id";
+const APP_KEY_HEADER = "Aomi-App-Key";
+
+function joinApiPath(baseUrl: string, path: string): string {
+  const normalizedBase = baseUrl === "/" ? "" : baseUrl.replace(/\/+$/, "");
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return `${normalizedBase}${normalizedPath}` || normalizedPath;
+}
+
+type ApiQueryValue = string | readonly string[] | undefined;
+
+// Every session-scoped request of a hosted-app thread carries application_id
+// (discovery and polls included): the edge routes on it to a backend that
+// holds the app's artifact.
+function applicationIdParam(id: ApplicationId | undefined): string | undefined {
+  return id?.toString().trim() || undefined;
+}
+
+function buildApiUrl(
+  baseUrl: string,
+  path: string,
+  query?: Record<string, ApiQueryValue>,
+): string {
+  const url = joinApiPath(baseUrl, path);
+  if (!query) return url;
+
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined) continue;
+    if (typeof value === "string") {
+      params.set(key, value);
+    } else {
+      for (const item of value) {
+        params.append(key, item);
+      }
+    }
+  }
+
+  const queryString = params.toString();
+  return queryString ? `${url}?${queryString}` : url;
+}
+
+function normalizeQuery(
+  query: AomiRequestOptions["query"],
+): Record<string, ApiQueryValue> | undefined {
+  if (!query) return undefined;
+  const normalized: Record<string, ApiQueryValue> = {};
+  for (const [key, value] of Object.entries(query)) {
+    if (Array.isArray(value)) {
+      normalized[key] = value.map((item) => String(item));
+      continue;
+    }
+    normalized[key] =
+      value === null || value === undefined ? undefined : String(value);
+  }
+  return normalized;
+}
+
+function normalizePlatformFilter(platforms: AomiPlatformFilter): string[] {
+  const rawValues = Array.isArray(platforms)
+    ? platforms
+    : platforms === null || platforms === undefined
+      ? []
+      : [platforms];
+
+  return Array.from(
+    new Set(
+      rawValues
+        .flatMap((value) => value.split(","))
+        .map((value) => value.trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
+function encodeJsonBody(body: unknown): BodyInit | undefined {
+  return body === undefined ? undefined : JSON.stringify(body);
+}
+
+function withSessionHeader(sessionId: string, init?: HeadersInit): HeadersInit {
+  const headers = new Headers(init);
+  headers.set(SESSION_ID_HEADER, sessionId);
+  headers.set(THREAD_ID_HEADER, sessionId);
+  return headers;
+}
+
+export function wrapFetchWithAccountBearer(
+  fetchImpl: typeof fetch,
+  getAccountBearer?: GetAccountBearer,
+  publicCommitAuth = false,
+): typeof fetch {
+  if (!getAccountBearer) return fetchImpl;
+
+  return async (input, init) => {
+    const request = input instanceof Request ? input : undefined;
+    const path = new URL(String(request?.url ?? input), "http://localhost")
+      .pathname;
+    // Commits belong to the Agent thread principal. When public auth is
+    // configured, keep its guest/OAuth identity for Commit requests too;
+    // a separate additive account bearer may belong to another user. A
+    // required session bearer remains the credential for all of these routes.
+    if (
+      !getAccountBearer.required &&
+      (path === "/v1/agent" ||
+        path.startsWith("/v1/agent/") ||
+        path === "/v1/pipeline" ||
+        path.startsWith("/v1/pipeline/") ||
+        (publicCommitAuth && isCommitPath(path)))
+    ) {
+      return fetchImpl(request ? request.clone() : input, init);
+    }
+    const baseHeaders = new Headers(init?.headers ?? request?.headers);
+    const fetchWithBearer = async (forceRefresh: boolean) => {
+      const headers = new Headers(baseHeaders);
+      // The account bearer is additive — never let a failing source break the
+      // request. A throwing/absent bearer just means no Authorization header.
+      let bearer: string | null | undefined;
+      try {
+        bearer = await getAccountBearer({ forceRefresh });
+      } catch (error) {
+        if (getAccountBearer.required) {
+          throw error;
+        }
+        bearer = undefined;
+      }
+      if (getAccountBearer.required && !bearer)
+        throw new Error("Required account session is unavailable");
+      if (bearer) {
+        headers.set("Authorization", `Bearer ${bearer}`);
+      }
+      // A Request body is single-use: hand fetch a clone so the 401 retry
+      // below can still send the original body.
+      return fetchImpl(request ? request.clone() : input, { ...init, headers });
+    };
+
+    const response = await fetchWithBearer(false);
+    if (response.status !== 401) return response;
+    return fetchWithBearer(true);
+  };
+}
+
+function isCommitPath(path: string): boolean {
+  return (
+    path === "/api/commits" ||
+    path.startsWith("/api/commits/") ||
+    path.startsWith("/v1/commits/")
+  );
+}
+
+export function wrapFetchWithPublicApiAuthorization(input: {
+  fetch: typeof fetch;
+  baseUrl: string;
+  oauth?: AomiOAuthTokenProvider;
+  guest?: GuestSessionProvider;
+}): typeof fetch {
+  if (!input.oauth && !input.guest) return input.fetch;
+  return async (requestInput, init) => {
+    const request = requestInput instanceof Request ? requestInput : undefined;
+    const url = new URL(
+      String(request?.url ?? requestInput),
+      absoluteBase(input.baseUrl),
+    );
+    const policy = publicApiPolicy(
+      url,
+      init?.method ?? request?.method ?? "GET",
+      init?.headers ?? request?.headers,
+    );
+    if (!policy) return input.fetch(requestInput, init);
+    const baseHeaders = new Headers(init?.headers ?? request?.headers);
+    const attempt = async (forceRefresh: boolean, dpopNonce?: string) => {
+      const headers = new Headers(baseHeaders);
+      if (input.oauth) {
+        const token = await input.oauth({
+          resource: policy.resource,
+          scopes: policy.scopes,
+          forceRefresh,
+        });
+        if (!token)
+          throw new AomiError(
+            "insufficient_scope",
+            "No OAuth grant covers this Aomi resource and scope set",
+          );
+        const tokenType = token.tokenType ?? "Bearer";
+        headers.set("authorization", `${tokenType} ${token.accessToken}`);
+        if (tokenType === "DPoP") {
+          if (!token.dpopProof) {
+            throw new Error("DPoP token provider returned no proof signer");
+          }
+          headers.set(
+            "dpop",
+            await token.dpopProof({
+              url: url.toString(),
+              method: policy.method,
+              accessToken: token.accessToken,
+              nonce: dpopNonce,
+            }),
+          );
+        }
+      } else if (input.guest) {
+        if (
+          !forceRefresh &&
+          policy.method === "POST" &&
+          url.pathname === "/v1/agent/chat"
+        )
+          await input.guest.prepare?.();
+        const credential = await input.guest({ forceRefresh });
+        // A renewed guest is a different person to the backend. A chat the
+        // old guest started must not continue under the new one; the caller
+        // starts a fresh chat instead.
+        if (
+          forceRefresh &&
+          input.guest.getIdentity &&
+          (baseHeaders.has("x-session-id") || baseHeaders.has("x-thread-id"))
+        )
+          throw AgentApiError.guestIdentityChanged();
+        if (credential) headers.set("authorization", `Bearer ${credential}`);
+      }
+      return input.fetch(request ? request.clone() : requestInput, {
+        ...init,
+        headers,
+      });
+    };
+    const response = await attempt(false);
+    if (response.status !== 401 && response.status !== 403) return response;
+    if (input.guest && response.status === 403) return response;
+    // App access failures concern the App, not this credential. Refreshing
+    // would mint a new guest identity (orphaning its threads) for nothing.
+    const failure = (await response
+      .clone()
+      .json()
+      .catch(() => null)) as { error?: unknown } | null;
+    const failureCode =
+      typeof failure?.error === "object" && failure.error !== null
+        ? (failure.error as { code?: unknown }).code
+        : failure?.error;
+    if (AgentApiError.APP_ACCESS_CODES.some((code) => code === failureCode)) {
+      return response;
+    }
+    const dpopNonce = response.headers.get("dpop-nonce") ?? undefined;
+    return attempt(!dpopNonce, dpopNonce);
+  };
+}
+
+/** The OAuth resource and scopes a route needs, from the edge's own table. */
+function publicApiPolicy(url: URL, method: string, headers?: HeadersInit) {
+  const upper = method.toUpperCase();
+  const route = ROUTE_SCOPES.find(
+    (row) => row.path.test(url.pathname) && row.methods[upper],
+  );
+  if (!route) return null;
+  const payment =
+    route.paid && new Headers(headers).has("payment-signature")
+      ? ["payments:submit"]
+      : [];
+  return {
+    resource: `${url.origin}${route.resource}` as AomiOAuthResource,
+    scopes: [route.methods[upper]!, ...payment],
+    method: upper,
+  };
+}
+
+function absoluteBase(baseUrl: string): string {
+  if (/^https?:\/\//.test(baseUrl)) return baseUrl;
+  if (typeof location !== "undefined")
+    return new URL(baseUrl, location.origin).toString();
+  return "http://localhost";
+}
+
+// =============================================================================
+// AomiClient
+// =============================================================================
+
+/** Build the credential path for the selected account transport. */
+function appSecretsPath(
+  applicationId: ApplicationId,
+  basePath: string,
+): string {
+  const id = String(applicationId ?? "").trim();
+  if (!id) {
+    throw new Error("applicationId is required for app secrets");
+  }
+  return `${basePath}/${encodeURIComponent(id)}/secrets`;
+}
+
+/** Best-effort `{ error }` body reader for user-facing failure messages. */
+async function readErrorDetail(response: Response): Promise<string | null> {
+  try {
+    const body = (await response.json()) as { error?: unknown };
+    return typeof body?.error === "string" ? body.error : null;
+  } catch {
+    return null;
+  }
+}
+
+export function secretNamesFrom(response: AomiListSecretsResponse): string[] {
+  if (response.names) return response.names;
+  return Object.values(response.by_app ?? {}).flat();
+}
+
+export class AomiClient {
+  readonly agent: AgentTransport;
+  readonly pipeline: PipelineTransport;
+  readonly account: AccountTransport;
+  readonly transactionSafety: TransactionSafetyTransport;
+  private readonly baseUrl: string;
+  private readonly apiKey?: string;
+  private readonly fetchImpl: typeof fetch;
+  private readonly publicFetchImpl: typeof fetch;
+  private readonly rawFetchImpl: typeof fetch;
+  private readonly logger?: Logger;
+  private readonly hasAccountAuth: boolean;
+  private readonly guestSession?: GuestSessionProvider;
+  private readonly accountAppsPath: string;
+
+  constructor(options: AomiClientOptions) {
+    // Strip trailing slash
+    this.baseUrl = options.baseUrl.replace(/\/+$/, "");
+    this.hasAccountAuth = Boolean(options.getAccountBearer || options.oauth);
+    this.accountAppsPath = options.oauth
+      ? "/v1/account/apps"
+      : "/api/account/apps";
+    this.apiKey = options.apiKey;
+    const fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
+    // Keep the caller's fetch implementation for tests and browser adapters;
+    // `raw` only bypasses the payment wrapper, it must not bypass auth or the
+    // configured transport itself.
+    this.publicFetchImpl = fetchImpl;
+    const rawFetchImpl = fetchImpl;
+    const guest =
+      options.oauth ||
+      options.guest === false ||
+      (options.getAccountBearer && options.guest === undefined)
+        ? undefined
+        : typeof options.guest === "function"
+          ? options.guest
+          : createGuestSessionProvider({
+              baseUrl: this.baseUrl,
+              fetch: fetchImpl,
+            });
+    const publicApiOauth = options.getAccountBearer?.required
+      ? undefined
+      : options.oauth;
+    const publicApiGuest = options.getAccountBearer?.required
+      ? undefined
+      : guest;
+    this.guestSession = publicApiGuest;
+    const publicCommitAuth = Boolean(publicApiOauth || publicApiGuest);
+    const authenticatedFetch = wrapFetchWithAccountBearer(
+      wrapFetchWithPublicApiAuthorization({
+        fetch: fetchImpl,
+        baseUrl: this.baseUrl,
+        oauth: publicApiOauth,
+        guest: publicApiGuest,
+      }),
+      options.getAccountBearer,
+      publicCommitAuth,
+    );
+    const authenticatedRawFetch = wrapFetchWithAccountBearer(
+      wrapFetchWithPublicApiAuthorization({
+        fetch: rawFetchImpl,
+        baseUrl: this.baseUrl,
+        oauth: publicApiOauth,
+        guest: publicApiGuest,
+      }),
+      options.getAccountBearer,
+      publicCommitAuth,
+    );
+    this.fetchImpl = options.x402
+      ? wrapFetchWithPaymentChallenges(authenticatedFetch, options.x402)
+      : authenticatedFetch;
+    // Raw requests are used for recovery probes. Re-wrapping them in x402
+    // would create a fresh proof for an idempotency key whose original proof
+    // may already have settled.
+    this.rawFetchImpl = authenticatedRawFetch;
+    this.logger = options.logger;
+    this.agent = new AgentTransport((method, path, requestOptions) =>
+      this.requestResponse(method, path, requestOptions),
+    );
+    this.pipeline = new PipelineTransport((method, path, requestOptions) =>
+      this.requestResponse(method, path, requestOptions),
+    );
+    this.transactionSafety = new TransactionSafetyTransport(
+      (method, path, requestOptions) =>
+        this.requestResponse(method, path, requestOptions),
+    );
+    this.account = new AccountTransport((method, path, requestOptions) =>
+      this.requestResponse(method, path, requestOptions),
+    );
+  }
+
+  // ===========================================================================
+  // Transport
+  // ===========================================================================
+
+  /** The anonymous user behind guest requests, once the backend has named it. */
+  guestIdentity(): string | null {
+    return this.guestSession?.getIdentity?.() ?? null;
+  }
+
+  /** Prepare guest auth on composer interaction. Existing signed-in cookies stay intact. */
+  async prepareGuestSession(): Promise<void> {
+    if (this.guestSession?.prepare) await this.guestSession.prepare();
+    else if (this.guestSession) await this.guestSession();
+  }
+
+  /**
+   * Low-level request escape hatch for the full backend route manifest.
+   * Prefer the typed helpers below for common chat/session/account flows.
+   */
+  async request<T = unknown>(
+    method: AomiHttpMethod,
+    path: string,
+    options?: AomiRequestOptions,
+  ): Promise<T> {
+    const response = await this.requestResponse(method, path, options);
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(
+        `HTTP ${response.status}: ${response.statusText}${body ? `\n${body}` : ""}`,
+      );
+    }
+    if (response.status === 204) return undefined as T;
+    const contentType = response.headers.get("content-type") ?? "";
+    return (
+      contentType.includes("application/json")
+        ? await response.json()
+        : await response.text()
+    ) as T;
+  }
+
+  /** Raw authenticated response transport shared by JSON, SSE, and MCP clients. */
+  async requestResponse(
+    method: AomiHttpMethod,
+    path: string,
+    options?: AomiRequestOptions,
+  ): Promise<Response> {
+    const url = buildApiUrl(this.baseUrl, path, normalizeQuery(options?.query));
+    const headers = new Headers(options?.headers);
+    if (options?.sessionId) {
+      headers.set(SESSION_ID_HEADER, options.sessionId);
+      headers.set(THREAD_ID_HEADER, options.sessionId);
+    }
+    const apiKey = options?.apiKey ?? this.apiKey;
+    if (apiKey) {
+      headers.set(APP_KEY_HEADER, apiKey);
+    }
+    if (options?.body !== undefined && !headers.has("Content-Type")) {
+      headers.set("Content-Type", "application/json");
+    }
+
+    const requestFetch = options?.x402
+      ? wrapFetchWithPaymentChallenges(this.rawFetchImpl, options.x402)
+      : options?.raw
+        ? this.rawFetchImpl
+        : this.fetchImpl;
+    const response = await requestFetch(url, {
+      method,
+      headers,
+      body: encodeJsonBody(options?.body),
+      signal: options?.signal,
+    });
+
+    return response;
+  }
+
+  // ===========================================================================
+  // Secrets
+  // ===========================================================================
+
+  /**
+   * Ingest client-scoped secrets. Returns opaque `$SECRET:<name>` handles.
+   *
+   * There is no app scope. A hosted app's Environment belongs to its Builder
+   * and is configured in Aomi Build; a per-user copy of it was a second,
+   * process-local store that answered the same handle differently depending on
+   * which fleet host served the turn. The backend answers 410 to any request
+   * that still carries one.
+   */
+  async ingestSecrets(
+    sessionId: string,
+    clientId: string,
+    secrets: Record<string, string>,
+  ): Promise<AomiIngestSecretsResponse> {
+    return {
+      handles: await this.account.keys.set(secrets, {
+        thread: sessionId,
+        clientId,
+      }),
+    };
+  }
+
+  /** Clear every client-scoped secret and unbind the session. */
+  async clearSecrets(
+    sessionId: string,
+    clientId: string,
+  ): Promise<AomiClearSecretsResponse> {
+    await this.account.keys.clear({ thread: sessionId, clientId });
+    return { cleared: true };
+  }
+
+  /** Remove a single named client-scoped secret. */
+  async deleteSecret(
+    sessionId: string,
+    clientId: string,
+    name: string,
+  ): Promise<AomiDeleteSecretResponse> {
+    return {
+      deleted: await this.account.keys.remove(name, {
+        thread: sessionId,
+        clientId,
+      }),
+    };
+  }
+
+  /**
+   * List the stored secret NAMES for this client — never values. Pass the
+   * client_id so the read finds the vault even after a backend restart lost
+   * the session→client binding.
+   */
+  async listSecrets(
+    sessionId: string,
+    clientId?: string,
+  ): Promise<AomiListSecretsResponse> {
+    return {
+      names: await this.account.keys.list({
+        thread: sessionId,
+        clientId: clientId?.trim() || undefined,
+      }),
+    };
+  }
+
+  /** Credential-free projection suitable for shared caching and public persistence. */
+  async getPublicCatalog<T = unknown>(
+    kind: "models" | "apps" | "skills",
+    options?: { signal?: AbortSignal; platforms?: AomiPlatformFilter },
+  ): Promise<T> {
+    const url = buildApiUrl(this.baseUrl, `/api/public/catalog/${kind}`, {
+      platform:
+        kind === "apps"
+          ? normalizePlatformFilter(options?.platforms)
+          : undefined,
+    });
+    const response = await this.publicFetchImpl(url, {
+      method: "GET",
+      credentials: "omit",
+      headers: { accept: "application/json" },
+      signal: options?.signal,
+    });
+    if (!response.ok)
+      throw new Error(`Public catalog request failed: HTTP ${response.status}`);
+    return (await response.json()) as T;
+  }
+
+  // ===========================================================================
+  // Control API
+  // ===========================================================================
+
+  /**
+   * Get available apps as full descriptors (name + declared secret slots).
+   * The settings page consumes the slot info to render per-app inputs and
+   * the chat shell uses it to gate app load when required slots are unfilled.
+   */
+  async getApps(
+    sessionId: string,
+    options?: {
+      signal?: AbortSignal;
+      apiKey?: string;
+      platforms?: AomiPlatformFilter;
+      applicationId?: ApplicationId;
+    },
+  ): Promise<AomiAppDescriptor[]> {
+    const platforms = normalizePlatformFilter(options?.platforms);
+    const url = buildApiUrl(this.baseUrl, "/api/thread/apps", {
+      platform: platforms.length > 0 ? platforms : undefined,
+      application_id: applicationIdParam(options?.applicationId),
+    });
+
+    const apiKey = options?.apiKey ?? this.apiKey;
+    const headers = new Headers(withSessionHeader(sessionId));
+    if (apiKey) {
+      headers.set(APP_KEY_HEADER, apiKey);
+    }
+
+    const response = await this.rawFetchImpl(url, {
+      headers,
+      signal: options?.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to get apps: HTTP ${response.status}`);
+    }
+
+    const data = (await response.json()) as unknown;
+    if (!Array.isArray(data)) return [];
+    return data
+      .map((item) => normalizeAppDescriptor(item))
+      .filter((item): item is AomiAppDescriptor => item !== null);
+  }
+
+  /** The one private app an App key opens. Credential-free. */
+  async resolveAppKey(
+    appKey: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<AomiAppDescriptor[]> {
+    const response = await this.publicFetchImpl(
+      buildApiUrl(this.baseUrl, "/api/thread/apps", { resolve_key: "true" }),
+      { headers: { [APP_KEY_HEADER]: appKey }, signal: options.signal },
+    );
+    if (!response.ok)
+      throw new AomiApiError(
+        response.status,
+        "app_key_unresolved",
+        `Failed to resolve the App key: HTTP ${response.status}`,
+      );
+    const rows: unknown = await response.json();
+    return (Array.isArray(rows) ? rows : []).flatMap(
+      (row) => normalizeAppDescriptor(row) ?? [],
+    );
+  }
+
+  /**
+   * Fetch the account bound to the authenticated request (resolved from the
+   * account bearer). Returns `null` when the session is not bound to a real
+   * user — the backend answers `/api/account` with HTTP 400 for
+   * anonymous sessions, which is the normal "no bearer / not logged in" case
+   * rather than an error.
+   */
+  async fetchAccountProfile(
+    sessionId: string,
+  ): Promise<AomiAccountProfile | null> {
+    const url = buildApiUrl(this.baseUrl, "/api/account");
+    const response = await this.rawFetchImpl(url, {
+      headers: withSessionHeader(sessionId),
+    });
+
+    if (
+      response.status === 400 ||
+      response.status === 401 ||
+      response.status === 403
+    ) {
+      return null;
+    }
+    if (!response.ok) {
+      throw new Error(
+        `Failed to fetch account profile: HTTP ${response.status}`,
+      );
+    }
+
+    return (await response.json()) as AomiAccountProfile;
+  }
+
+  /** Apply the account's current signing route to a UserState. Sends no
+   * longer call this: the backend applies the same default server-side.
+   * Re-reads policy on each call; mode changes and revocations must not be
+   * hidden behind a session-long account cache.
+   */
+  async prepareUserState(
+    sessionId: string,
+    state: UserState,
+  ): Promise<UserState> {
+    if (!this.hasAccountAuth || (!state.evm?.address && !state.svm?.address))
+      return state;
+    const profile = await this.fetchAccountProfile(sessionId);
+    return profile ? UserState.route(state, profile) : state;
+  }
+
+  /**
+   * Fetch the full account for the authenticated request. Throws on any
+   * non-OK response; use `fetchAccountProfile` for the null-on-anonymous
+   * variant.
+   */
+  async getAccount(sessionId: string): Promise<AomiAccountResponse> {
+    const url = buildApiUrl(this.baseUrl, "/api/account");
+    const response = await this.fetchImpl(url, {
+      headers: withSessionHeader(sessionId),
+    });
+
+    if (!response.ok) {
+      throw new AomiApiError(
+        response.status,
+        "account_request_failed",
+        `Failed to fetch account: HTTP ${response.status}`,
+      );
+    }
+
+    return (await response.json()) as AomiAccountResponse;
+  }
+
+  /** List the full app catalog available to the signed-in account. */
+  async listAccountApps(sessionId: string): Promise<AomiAppDescriptor[]> {
+    const url = buildApiUrl(this.baseUrl, this.accountAppsPath);
+    const response = await this.fetchImpl(url, {
+      headers: withSessionHeader(sessionId),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to list account apps: HTTP ${response.status}`);
+    }
+
+    const data = (await response.json()) as unknown;
+    if (!Array.isArray(data)) return [];
+    return data
+      .map((item) => normalizeAppDescriptor(item))
+      .filter((item): item is AomiAppDescriptor => item !== null);
+  }
+
+  /**
+   * Atomically install one exact application row. A private app the account
+   * cannot see yet needs its `apiKey`; the backend reads it on its own route.
+   */
+  async addAccountApp(
+    sessionId: string,
+    applicationId: ApplicationId,
+    options: { apiKey?: string } = {},
+  ): Promise<AomiAccountAppMutationResponse> {
+    const url = buildApiUrl(
+      this.baseUrl,
+      `${options.apiKey ? "/api/account/apps" : this.accountAppsPath}/${encodeURIComponent(String(applicationId))}`,
+    );
+    const headers = new Headers(withSessionHeader(sessionId));
+    if (options.apiKey) headers.set(APP_KEY_HEADER, options.apiKey);
+    const response = await this.fetchImpl(url, { method: "POST", headers });
+
+    if (!response.ok) {
+      throw new Error(`Failed to install account app: HTTP ${response.status}`);
+    }
+
+    return (await response.json()) as AomiAccountAppMutationResponse;
+  }
+
+  /** Atomically uninstall one exact application row. */
+  async removeAccountApp(
+    sessionId: string,
+    applicationId: ApplicationId,
+  ): Promise<AomiAccountAppMutationResponse> {
+    const url = buildApiUrl(
+      this.baseUrl,
+      `${this.accountAppsPath}/${encodeURIComponent(String(applicationId))}`,
+    );
+    const response = await this.fetchImpl(url, {
+      method: "DELETE",
+      headers: withSessionHeader(sessionId),
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `Failed to uninstall account app: HTTP ${response.status}`,
+      );
+    }
+
+    return (await response.json()) as AomiAccountAppMutationResponse;
+  }
+
+  /**
+   * Get available models.
+   */
+  async getModels(
+    sessionId: string,
+    options?: {
+      signal?: AbortSignal;
+      apiKey?: string;
+      applicationId?: ApplicationId;
+    },
+  ): Promise<string[]> {
+    const url = buildApiUrl(this.baseUrl, "/api/thread/models", {
+      application_id: applicationIdParam(options?.applicationId),
+    });
+    const apiKey = options?.apiKey ?? this.apiKey;
+    const headers = new Headers(withSessionHeader(sessionId));
+    if (apiKey) {
+      headers.set(APP_KEY_HEADER, apiKey);
+    }
+
+    const response = await this.rawFetchImpl(url, {
+      headers,
+      signal: options?.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to get models: HTTP ${response.status}`);
+    }
+
+    return (await response.json()) as string[];
+  }
+
+  /**
+   * Set the model for a session.
+   */
+  async setModel(
+    sessionId: string,
+    rig: string,
+    options?: {
+      app?: string;
+      applicationId?: ApplicationId;
+      apiKey?: string;
+      clientId?: string;
+    },
+  ): Promise<{
+    success: boolean;
+    rig: string;
+    baml: string;
+    created: boolean;
+  }> {
+    const apiKey = options?.apiKey ?? this.apiKey;
+    const url = buildApiUrl(this.baseUrl, "/api/thread/model", {
+      rig,
+      app: options?.app,
+      application_id: applicationIdParam(options?.applicationId),
+      client_id: options?.clientId,
+    });
+
+    const headers = new Headers(withSessionHeader(sessionId));
+    if (apiKey) {
+      headers.set(APP_KEY_HEADER, apiKey);
+    }
+
+    const response = await this.fetchImpl(url, {
+      method: "POST",
+      headers,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to set model: HTTP ${response.status}`);
+    }
+
+    return (await response.json()) as {
+      success: boolean;
+      rig: string;
+      baml: string;
+      created: boolean;
+    };
+  }
+
+  // ===========================================================================
+  // Per-user app secrets (client-supplied API keys)
+  // ===========================================================================
+  //
+  // Apps can ask each signed-in user for their own credentials. These values
+  // are account-scoped and durable on the backend, and are resolved for every
+  // dynamic invocation of that app. Distinct from `ingestSecrets`, which is
+  // the ephemeral browser-scoped store.
+
+  /**
+   * The slots an app declares with the current account's configuration
+   * state. Never values.
+   */
+  async listAppSecrets(
+    sessionId: string,
+    applicationId: ApplicationId,
+  ): Promise<AomiUserAppSecrets> {
+    const url = joinApiPath(
+      this.baseUrl,
+      appSecretsPath(applicationId, this.accountAppsPath),
+    );
+    const response = await this.fetchImpl(url, {
+      headers: withSessionHeader(sessionId),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to list app secrets: HTTP ${response.status}`);
+    }
+
+    return (await response.json()) as AomiUserAppSecrets;
+  }
+
+  /** Read per-user credential status for one application ID. */
+  getAppCredentialsStatus(
+    sessionId: string,
+    applicationId: ApplicationId,
+  ): Promise<AomiUserAppSecrets> {
+    return this.listAppSecrets(sessionId, applicationId);
+  }
+
+  /**
+   * Save (upsert) the current account's own values for some of an app's
+   * slots. Slots omitted from `secrets` are left untouched, so one key can
+   * be rotated without re-entering the others.
+   */
+  async saveAppSecrets(
+    sessionId: string,
+    applicationId: ApplicationId,
+    secrets: Record<string, string>,
+  ): Promise<AomiUserAppSecrets> {
+    const url = joinApiPath(
+      this.baseUrl,
+      appSecretsPath(applicationId, this.accountAppsPath),
+    );
+    const response = await this.fetchImpl(url, {
+      method: "POST",
+      headers: withSessionHeader(sessionId, {
+        "Content-Type": "application/json",
+      }),
+      body: JSON.stringify({ secrets }),
+    });
+
+    if (!response.ok) {
+      const detail = await readErrorDetail(response);
+      throw new Error(
+        `Failed to save app secrets: HTTP ${response.status}${detail ? ` (${detail})` : ""}`,
+      );
+    }
+
+    return (await response.json()) as AomiUserAppSecrets;
+  }
+
+  /** Save one declared per-user credential. The value is never returned. */
+  setAppCredential(
+    sessionId: string,
+    applicationId: ApplicationId,
+    name: string,
+    value: string,
+  ): Promise<AomiUserAppSecrets> {
+    return this.saveAppSecrets(sessionId, applicationId, { [name]: value });
+  }
+
+  /** Replace one saved credential. The backend uses the same secure upsert. */
+  replaceAppCredential(
+    sessionId: string,
+    applicationId: ApplicationId,
+    name: string,
+    value: string,
+  ): Promise<AomiUserAppSecrets> {
+    return this.setAppCredential(sessionId, applicationId, name, value);
+  }
+
+  /** Remove one of the current account's own values for an app. */
+  async deleteAppSecret(
+    sessionId: string,
+    applicationId: ApplicationId,
+    name: string,
+  ): Promise<AomiDeleteSecretResponse> {
+    const url = joinApiPath(
+      this.baseUrl,
+      `${appSecretsPath(applicationId, this.accountAppsPath)}/${encodeURIComponent(name)}`,
+    );
+    const response = await this.fetchImpl(url, {
+      method: "DELETE",
+      headers: withSessionHeader(sessionId),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to delete app secret: HTTP ${response.status}`);
+    }
+
+    return (await response.json()) as AomiDeleteSecretResponse;
+  }
+
+  /** Remove one saved per-user credential by application ID. */
+  removeAppCredential(
+    sessionId: string,
+    applicationId: ApplicationId,
+    name: string,
+  ): Promise<AomiDeleteSecretResponse> {
+    return this.deleteAppSecret(sessionId, applicationId, name);
+  }
+
+  /** Remove every value the current account stored for an app. */
+  async clearAppSecrets(
+    sessionId: string,
+    applicationId: ApplicationId,
+  ): Promise<AomiClearAppSecretsResponse> {
+    const url = joinApiPath(
+      this.baseUrl,
+      appSecretsPath(applicationId, this.accountAppsPath),
+    );
+    const response = await this.fetchImpl(url, {
+      method: "DELETE",
+      headers: withSessionHeader(sessionId),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to clear app secrets: HTTP ${response.status}`);
+    }
+
+    return (await response.json()) as AomiClearAppSecretsResponse;
+  }
+
+  // ===========================================================================
+  // Batch Simulation
+  // ===========================================================================
+
+  /**
+   * Simulate transactions as an atomic batch.
+   * Each tx sees state changes from previous txs (e.g., approve → swap).
+   * Sends full tx payloads — the backend does not look up by ID.
+   */
+  async simulateBatch(
+    sessionId: string,
+    transactions: Array<{
+      to: string;
+      value?: string;
+      data?: string;
+      label?: string;
+      chain_id?: number;
+      chainId?: number;
+    }>,
+    options?: { from?: string; chainId?: number },
+  ): Promise<AomiSimulateResponse> {
+    const url = joinApiPath(this.baseUrl, "/api/exec/simulate");
+    const headers = new Headers(
+      withSessionHeader(sessionId, { "Content-Type": "application/json" }),
+    );
+    if (this.apiKey) {
+      headers.set(APP_KEY_HEADER, this.apiKey);
+    }
+
+    const normalizedTransactions = transactions.map((transaction) => ({
+      to: transaction.to,
+      value: transaction.value,
+      data: transaction.data,
+      label: transaction.label,
+      chain_id: transaction.chain_id ?? transaction.chainId ?? options?.chainId,
+    }));
+
+    const payload = {
+      transactions: normalizedTransactions,
+      from: options?.from,
+      chain_id: options?.chainId,
+    };
+
+    const response = await this.fetchImpl(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      const detail = body?.error;
+      throw new SimulationApiError(
+        response.status,
+        detail &&
+          typeof detail.code === "string" &&
+          typeof detail.message === "string" &&
+          Array.isArray(detail.partial?.contexts) &&
+          Array.isArray(detail.partial?.steps)
+          ? detail
+          : undefined,
+      );
+    }
+
+    return (await response.json()) as AomiSimulateResponse;
+  }
+}

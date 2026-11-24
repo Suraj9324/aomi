@@ -1,0 +1,84 @@
+:root {
+  color: #e9eef5;
+  background: #080b10;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+.shell,
+.setup {
+  width: min(1180px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 32px 0;
+}
+
+.shell > header {
+  max-width: 760px;
+  margin-bottom: 24px;
+}
+
+.shell > header h1,
+.shell > header p,
+.setup h1,
+.setup p {
+  margin-top: 0;
+}
+
+.shell > header h1,
+.setup h1 {
+  margin-bottom: 8px;
+  font-size: clamp(2rem, 5vw, 3.75rem);
+  line-height: 1;
+}
+
+.shell > header p,
+.setup p {
+  color: #aeb9c8;
+  line-height: 1.6;
+}
+
+.eyebrow {
+  margin-bottom: 8px;
+  color: #7ce3bd;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.provider-fixtures {
+  display: flex;
+  gap: 8px;
+  margin: 18px 0 10px;
+}
+
+.provider-fixtures a {
+  padding: 9px 12px;
+  border: 1px solid #26313f;
+  border-radius: 999px;
+  color: #aeb9c8;
+  background: #10161f;
+  font-size: 0.875rem;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.provider-fixtures a.active {
+  border-color: #2e8d6f;
+  color: #07120e;
+  background: #7ce3bd;
+}
+
+.fixture-note {
+  margin: 0;
+  font-size: 0.82rem;
+}

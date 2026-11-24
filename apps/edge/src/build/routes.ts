@@ -1,0 +1,126 @@
+/**
+ * The Build surface at the edge: GitHub sign-in, CLI login, builder credits,
+ * the anonymous GitHub App install start and the launch, deployments and
+ * operate control-plane families (over the `@aomi-labs/internal` manager
+ * client) and builder API key management. Anything not listed here passes
+ * through to the Vercel Build app unchanged: the build sandbox, integrations
+ * and the local-only helpers.
+ *
+ * A request presenting a builder API key is served only by the `endpoint()`
+ * routes, whose manager calls carry the key's builder bearer. Every other
+ * route, builder credits and the pass-through answer it 403.
+ */
+import { runnerRequest } from "./runner";
+import { EdgeError } from "../kernel/errors";
+import { passThrough as passThroughTo, proxy, target } from "../kernel/proxy";
+import { BACKEND_API_HEADERS } from "../portal/headers";
+import { carriesApiKey, KEY_ROUTES } from "./api-keys";
+import type { BuildContext } from "./context";
+import { BUILDER_CREDITS_PREFIX, credits } from "./credits";
+import { DEPLOY_ROUTES } from "./deploy";
+import { type BuildRoute, type Handler } from "./endpoint";
+import { failureResponse } from "./failures";
+import { apiOrigin } from "./manager-client";
+import { OPERATE_ROUTES } from "./operate";
+import {
+  callback,
+  claim,
+  cliExchange,
+  cliLogin,
+  cliStatus,
+  login,
+  signout,
+  status,
+} from "./github-auth";
+
+export const GITHUB_APP_INSTALL_START_PATH = "/api/integrations/github-app/oauth/start";
+
+/** Build forwards only the GitHub App install start, anonymously. */
+async function installStart(request: Request, ctx: BuildContext): Promise<Response> {
+  const url = target(
+    apiOrigin(request, ctx, GITHUB_APP_INSTALL_START_PATH),
+    GITHUB_APP_INSTALL_START_PATH,
+    new URL(request.url).search,
+  );
+  if (!url.searchParams.get("platform")) url.searchParams.set("platform", ctx.config.defaultPlatform);
+  return proxy(request, url, { fetchImpl: ctx.fetchImpl, headers: BACKEND_API_HEADERS });
+}
+
+export const BUILD_ROUTES: readonly BuildRoute[] = [
+  { operation: "github.login", method: "GET", path: "/api/build/auth/github/login", handle: login },
+  { operation: "github.callback", method: "GET", path: "/api/build/auth/github/callback", handle: callback },
+  { operation: "github.claim", method: "GET", path: "/api/build/auth/github/claim", handle: claim },
+  { operation: "github.status", method: "GET", path: "/api/build/auth/github/status", handle: status },
+  { operation: "github.signout", method: "POST", path: "/api/build/auth/github/signout", handle: signout },
+  { operation: "cli.login", method: "GET", path: "/api/build/cli/login", handle: cliLogin },
+  { operation: "cli.exchange", method: "POST", path: "/api/build/cli/exchange", handle: cliExchange },
+  { operation: "cli.status", method: "GET", path: "/api/build/cli/status", handle: cliStatus },
+  { operation: "github_app.install_start", method: "GET", path: GITHUB_APP_INSTALL_START_PATH, handle: installStart },
+  ...KEY_ROUTES,
+  ...DEPLOY_ROUTES,
+  ...OPERATE_ROUTES,
+];
+
+function matches(route: BuildRoute, pathname: string): boolean {
+  return typeof route.path === "string" ? route.path === pathname : route.path.test(pathname);
+}
+
+export function passThrough(request: Request, ctx: BuildContext): Promise<Response> {
+  return passThroughTo(request, ctx.upstreamOrigin, ctx.fetchImpl, "build", ctx.env.BUILD_PAGES);
+}
+
+async function run(operation: string, handle: Handler, request: Request, ctx: BuildContext): Promise<Response> {
+  try {
+    return await handle(request, ctx);
+  } catch (error) {
+    return failureResponse(error, request, operation);
+  }
+}
+
+/** An API key reaches only the routes that carry it to the manager as its builder. */
+const refuseKey: Handler = () => {
+  throw new EdgeError(403, "api_key_not_allowed");
+};
+
+/** Serve one request on the Build surface. */
+export async function handleBuildRequest(request: Request, ctx: BuildContext): Promise<Response> {
+  const url = new URL(request.url);
+  const withKey = carriesApiKey(request);
+  if (ctx.env.BUILD_RUNNER && /^\/api\/build\/runs(?:\/|$)/.test(url.pathname))
+    return run("build.runner", withKey ? refuseKey : runnerRequest, request, ctx);
+  if (url.pathname === BUILDER_CREDITS_PREFIX || url.pathname.startsWith(`${BUILDER_CREDITS_PREFIX}/`))
+    return run("builder.credits", withKey ? refuseKey : credits, request, ctx);
+  const routes = BUILD_ROUTES.filter((route) => matches(route, url.pathname));
+  if (routes.length) {
+    const route = routes.find((candidate) => candidate.method === request.method);
+    if (!route)
+      return new Response(null, {
+        status: 405,
+        headers: { allow: routes.map((candidate) => candidate.method).join(", ") },
+      });
+    return run(route.operation, withKey && !route.keys ? refuseKey : route.handle, request, ctx);
+  }
+  if (withKey) return run("pass_through", refuseKey, request, ctx);
+  const canonical = legacyPageRedirect(request, ctx);
+  if (canonical) return canonical;
+  return passThrough(request, ctx);
+}
+
+/**
+ * The first BUILD_HOSTS entry is the canonical Build host. A page on any other
+ * listed host (production's old build.aomi.dev) answers 308 there, so pages
+ * and GitHub sign-in live on one origin. Its /api/ and /v1/ paths keep being
+ * served in place: an API client following a cross-origin redirect would drop
+ * its Authorization header.
+ */
+function legacyPageRedirect(request: Request, ctx: BuildContext): Response | null {
+  const url = new URL(request.url);
+  const [canonical] = ctx.config.hosts;
+  if (!canonical || url.host.toLowerCase() === canonical) return null;
+  if (request.method !== "GET" && request.method !== "HEAD") return null;
+  if (/^\/(?:api|v1)(?:\/|$)/.test(url.pathname)) return null;
+  return new Response(null, {
+    status: 308,
+    headers: { "cache-control": "no-store", location: `https://${canonical}${url.pathname}${url.search}` },
+  });
+}

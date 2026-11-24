@@ -1,0 +1,90 @@
+"use client";
+
+import { useState } from "react";
+import {
+  AomiApiError,
+  POLICY_ERROR_CODES,
+  type AomiAccountConnection,
+  type AomiConnectionWalletsUpdate,
+  type AomiAskMode,
+  type AomiWalletPolicies,
+} from "@aomi-labs/client";
+import { useConfirmDialog } from "@/ui/aomi/confirm-dialog";
+import { useShellAomi } from "@/account/transport";
+import { useRefreshWallets } from "@/account/agent-wallets/use-refresh-wallets";
+
+/**
+ * Sets a connection's ask mode on an agent wallet; Instant asks first. While a
+ * connection saves, `saving[key]` is the list it will hold, so the picker
+ * moves at once and the server catches up behind it. Render `dialog`.
+ *
+ * Instant on a wallet whose policy admin is a wallet is refused with 403
+ * `rules_signature_required`: the change is filed as a policy change instead,
+ * and `onPoliciesFiled` gets the policies it now waits in.
+ */
+export function useAccessWrite(
+  onPoliciesFiled?: (policies: AomiWalletPolicies) => void,
+) {
+  const aomi = useShellAomi();
+  const refresh = useRefreshWallets();
+  const { confirm, dialog } = useConfirmDialog();
+  const [saving, setSaving] = useState<
+    Record<string, AomiConnectionWalletsUpdate["wallets"]>
+  >({});
+  const [error, setError] = useState<string | null>(null);
+
+  const write = async (
+    connection: AomiAccountConnection,
+    wallet: { id: string; name: string },
+    askMode: AomiAskMode,
+    /** The connection's name in the Instant prompt. */
+    title: string,
+  ) => {
+    const { key } = connection;
+    if (saving[key]) return;
+    if (
+      askMode === "instant" &&
+      !(await confirm({
+        title: "Sign without asking?",
+        description: `Trades from ${title} with "${wallet.name}" will sign without asking.`,
+        confirmLabel: "Turn on",
+      }))
+    )
+      return;
+    // Archived wallets stay listed too, so a Restore brings their ask modes back.
+    const wallets: AomiConnectionWalletsUpdate["wallets"] = [
+      ...connection.wallets
+        .filter((entry) => entry.id !== wallet.id)
+        .map((entry) => ({ id: entry.id, ask_mode: entry.ask_mode })),
+      { id: wallet.id, ask_mode: connection.ask_only ? "ask_aomi" : askMode },
+    ];
+    setSaving((current) => ({ ...current, [key]: wallets }));
+    setError(null);
+    try {
+      await aomi.account.connections.setConnectionWallets(key, { wallets });
+      await refresh();
+    } catch (caught) {
+      if (
+        !(caught instanceof AomiApiError) ||
+        caught.code !== POLICY_ERROR_CODES.signatureRequired
+      )
+        return setError("Couldn’t save that. Try again.");
+      try {
+        const filed = await aomi.account.policy.change(wallet.id, {
+          instant: [key],
+        });
+        if (onPoliciesFiled) onPoliciesFiled(filed.rules);
+        else
+          setError(
+            `Instant on "${wallet.name}" needs its admin wallet to sign. Open Policies in Settings to approve it.`,
+          );
+      } catch {
+        setError("Couldn’t save that. Try again.");
+      }
+    } finally {
+      setSaving(({ [key]: _, ...rest }) => rest);
+    }
+  };
+
+  return { write, saving, error, dialog };
+}

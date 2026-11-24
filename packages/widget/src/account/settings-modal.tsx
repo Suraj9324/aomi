@@ -1,0 +1,322 @@
+"use client";
+
+import { cn } from "@/lib/cn";
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentType,
+} from "react";
+import {
+  CreditCardIcon,
+  GearSixIcon,
+  PlugsIcon,
+  ScrollIcon,
+  ShieldCheckIcon,
+  SlidersHorizontalIcon,
+  UserCircleIcon,
+} from "@/icons/ui-icons";
+import { useAomiWalletKit } from "@/wallet/context";
+import { AomiButton } from "@/ui/aomi/button";
+import { LoadingPane } from "@/ui/aomi/loading-pane";
+import {
+  ModalHeader,
+  ModalNav,
+  ModalNavItem,
+  ModalShell,
+  ModalSidebar,
+} from "@/ui/aomi/modal-shell";
+import { GeneralSettings } from "./general-settings";
+import { BillingSettings } from "@/account/usage/billing-settings";
+import { PolicyPage } from "@/account/policy/policy-page";
+import { useAomiSession, type AomiSessionStatus } from "./aomi-session-bridge";
+/**
+ * Tab ids are stable deep-link keys; "policy" is labelled Safety and
+ * "policies" holds the agent wallets' policies.
+ */
+import {
+  SettingsNavContext,
+  type PolicyFocus,
+  type SettingsTab,
+} from "./settings-events";
+
+// Load with their tab, off the host bundle.
+const AccountSettings = lazy(() =>
+  import("./account-settings").then((module) => ({
+    default: module.AccountSettings,
+  })),
+);
+const ConnectionsSettings = lazy(() =>
+  import("@/account/connections/connections-settings").then((module) => ({
+    default: module.ConnectionsSettings,
+  })),
+);
+const PoliciesSettings = lazy(() =>
+  import("@/account/policies/policies-settings").then((module) => ({
+    default: module.PoliciesSettings,
+  })),
+);
+
+export type { PolicyFocus, SettingsTab };
+
+const NAV: {
+  id: SettingsTab;
+  label: string;
+  Icon: ComponentType<{ className?: string }>;
+}[] = [
+  {
+    id: "general",
+    label: "General",
+    Icon: SlidersHorizontalIcon,
+  },
+  {
+    id: "account",
+    label: "Account",
+    Icon: UserCircleIcon,
+  },
+  {
+    id: "connections",
+    label: "Connections",
+    Icon: PlugsIcon,
+  },
+  {
+    id: "policies",
+    label: "Policies",
+    Icon: ScrollIcon,
+  },
+  {
+    id: "policy",
+    label: "Safety",
+    Icon: ShieldCheckIcon,
+  },
+  {
+    id: "usage",
+    label: "Billing",
+    Icon: CreditCardIcon,
+  },
+];
+
+function GateAction({
+  children,
+  onClick,
+}: {
+  children: string;
+  onClick: () => void;
+}) {
+  return (
+    <AomiButton variant="primary" onClick={onClick}>
+      {children}
+    </AomiButton>
+  );
+}
+
+function GateNotice({
+  status,
+  walletConnected,
+  detail,
+  onRetry,
+  onConnect,
+}: {
+  status: Exclude<AomiSessionStatus, "ready" | "establishing">;
+  walletConnected?: boolean;
+  detail?: string;
+  onRetry: () => void;
+  onConnect?: () => void;
+}) {
+  return (
+    <div className="flex h-full w-full flex-col items-center justify-center gap-3 px-6 py-10 text-center">
+      {status === "anonymous" && walletConnected && (
+        <>
+          <span className="type-row text-aomi-fg">Finish signing in</span>
+          <span className="type-meta text-aomi-muted max-w-sm">
+            Your wallet is connected, but your account session isn’t set up yet.
+            Sign in to view and manage your settings.
+          </span>
+          {detail && (
+            <span className="type-meta text-aomi-danger max-w-sm">
+              {detail}
+            </span>
+          )}
+          <GateAction onClick={onRetry}>Sign in</GateAction>
+        </>
+      )}
+      {status === "anonymous" && !walletConnected && (
+        <>
+          <span className="type-row text-aomi-fg">Connect your account</span>
+          <span className="type-meta text-aomi-muted max-w-sm">
+            Settings are tied to your account. Connect to view and manage them.
+          </span>
+          {onConnect && (
+            <GateAction onClick={onConnect}>Connect account</GateAction>
+          )}
+        </>
+      )}
+      {status === "error" && (
+        <>
+          <span className="type-meta text-aomi-muted">
+            Couldn’t connect your account. Please try again.
+          </span>
+          <GateAction onClick={onRetry}>Retry</GateAction>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Settings shares Library's persistent sidebar and quiet directory surfaces. */
+export function SettingsModal({
+  onClose,
+  initialTab = "general",
+  accountOnly = false,
+  initialTopUp = false,
+  policyFocus,
+}: {
+  onClose: () => void;
+  initialTab?: SettingsTab;
+  /** The wallet and policy the Policies tab opens on. */
+  policyFocus?: PolicyFocus;
+  accountOnly?: boolean;
+  initialTopUp?: boolean;
+}) {
+  const [tab, setTab] = useState<SettingsTab>(
+    accountOnly ? "account" : initialTab,
+  );
+  useEffect(() => {
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.defaultPrevented) onClose();
+    };
+    document.addEventListener("keydown", escape);
+    return () => document.removeEventListener("keydown", escape);
+  }, [onClose]);
+  const { status, retry } = useAomiSession();
+  const adapter = useAomiWalletKit();
+  const [visited, setVisited] = useState<SettingsTab[]>([
+    accountOnly ? "account" : initialTab,
+  ]);
+  const selectTab = (next: SettingsTab) => {
+    setTab(next);
+    setVisited((tabs) => (tabs.includes(next) ? tabs : [...tabs, next]));
+  };
+  const hadSession = useRef(status === "ready");
+  useEffect(() => {
+    if (status === "ready") hadSession.current = true;
+    else if (status === "anonymous" && hadSession.current) onClose();
+  }, [status, onClose]);
+  const activeNav = NAV.find((item) => item.id === tab) ?? NAV[0];
+
+  const renderContent = () => {
+    if (status === "establishing" && !hadSession.current) {
+      return <LoadingPane label="Connecting your account" />;
+    }
+    if (status === "anonymous" || (status === "error" && !hadSession.current)) {
+      return (
+        <GateNotice
+          status={status}
+          walletConnected={adapter.identity.isConnected}
+          detail={adapter.accountError}
+          onRetry={retry}
+          onConnect={() => {
+            void adapter.connect?.();
+          }}
+        />
+      );
+    }
+
+    return (
+      // Every tab fills the pane on the header's px-6 edges; pages never set
+      // their own width.
+      <div
+        data-settings-column
+        className="flex w-full flex-1 flex-col px-4 pb-6 pt-1 md:px-6"
+        key={adapter.accountUser?.id ?? "session"}
+      >
+        {status === "error" && (
+          <div className="border-aomi-border bg-aomi-surface-2 text-aomi-muted type-meta rounded-control mb-5 flex items-center justify-between gap-3 border px-3.5 py-2.5">
+            <span>
+              Couldn’t refresh your account — some live data may be unavailable.
+            </span>
+            <AomiButton variant="ghost" size="sm" onClick={retry}>
+              Retry
+            </AomiButton>
+          </div>
+        )}
+        {NAV.filter(({ id }) => visited.includes(id)).map(({ id }) => (
+          <div
+            key={id}
+            hidden={tab !== id}
+            className={cn(
+              "flex flex-1 flex-col",
+              tab === id && "animate-in-fade",
+            )}
+          >
+            {id === "general" ? (
+              <GeneralSettings
+                onManageAccount={() => selectTab("account")}
+                onViewBilling={() => selectTab("usage")}
+              />
+            ) : id === "account" ? (
+              <Suspense fallback={<LoadingPane label="Loading your account" />}>
+                <AccountSettings onClose={onClose} />
+              </Suspense>
+            ) : id === "connections" ? (
+              <Suspense fallback={<LoadingPane label="Loading connections" />}>
+                <ConnectionsSettings />
+              </Suspense>
+            ) : id === "policies" ? (
+              <Suspense fallback={<LoadingPane label="Loading policies" />}>
+                <PoliciesSettings
+                  active={tab === "policies"}
+                  focus={policyFocus}
+                />
+              </Suspense>
+            ) : id === "usage" ? (
+              <BillingSettings initialTopUp={initialTopUp} />
+            ) : (
+              <PolicyPage />
+            )}
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  return (
+    <ModalShell
+      labelledBy="settings-title"
+      dismissLabel="Dismiss settings"
+      closeLabel="Close settings"
+      onClose={onClose}
+    >
+      <ModalSidebar
+        title="Settings"
+        titleId="settings-title"
+        icon={GearSixIcon}
+      >
+        <ModalNav label="Settings sections" className="mt-2 md:mt-3">
+          {NAV.filter((item) => !accountOnly || item.id === "account").map(
+            ({ id, label, Icon }) => (
+              <ModalNavItem
+                key={id}
+                label={label}
+                icon={Icon}
+                active={id === tab}
+                onClick={() => selectTab(id)}
+              />
+            ),
+          )}
+        </ModalNav>
+      </ModalSidebar>
+
+      <section className="flex min-h-0 min-w-0 flex-col">
+        <ModalHeader title={activeNav.label} />
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+          <SettingsNavContext.Provider value={accountOnly ? null : selectTab}>
+            {renderContent()}
+          </SettingsNavContext.Provider>
+        </div>
+      </section>
+    </ModalShell>
+  );
+}

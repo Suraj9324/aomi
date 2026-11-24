@@ -1,0 +1,982 @@
+import { describe, expect, it } from "vitest";
+import {
+  projectConversationEvents,
+  type Action,
+  type CommitView,
+  type Event,
+} from "@aomi-labs/client";
+import {
+  selectActivity,
+  selectLegacyReviewAction,
+  selectPolicyChangeIds,
+  selectPolicyFilings,
+  selectReviewQueue,
+} from "./model";
+
+const tx = {
+  chain_id: 8453,
+  from: "0x123",
+  to: "0x456",
+  data: "0xabcdef",
+  value: "0",
+  label: "Swap USDT to USDC",
+  kind: "swap",
+};
+const meta = (sequence: number, turn_id = "turn-1") => ({
+  sequence,
+  turn_id,
+  event_id: `e-${sequence}`,
+  occurred_at: sequence,
+});
+const tool = (
+  sequence: number,
+  tool_name: string,
+  result: unknown,
+  turn = "turn-1",
+): Event => ({
+  ...meta(sequence, turn),
+  type: "message",
+  sender: "agent",
+  content: "",
+  tool_name,
+  tool_result: [tool_name, JSON.stringify(result)],
+});
+const action = (sequence: number, patch: Partial<Action> = {}): Action => ({
+  ...meta(sequence),
+  type: "action",
+  id: "a1",
+  revision: 1,
+  state: "pending",
+  created_at: sequence,
+  expires_at: null,
+  request: {
+    type: "execute_evm",
+    transactions: [tx],
+    simulation: {
+      status: "passed",
+      balanceChanges: [],
+      approvals: [],
+      fees: [],
+      guards: [],
+      logs: [],
+      warnings: [],
+      gas: null,
+    },
+  },
+  ...patch,
+});
+const stage = tool(1, "evm_stage_tx", {
+  ...tx,
+  pending_tx_id: 1,
+  current_lifecycle: "queued",
+});
+const durableCommit = (
+  sourceId: number,
+  index: number,
+  patch: Partial<CommitView> = {},
+): CommitView => ({
+  version: 1,
+  commit_id: `commit-${sourceId}`,
+  thread_id: "thread-1",
+  stage_id: `evm:${sourceId}`,
+  chain_family: "evm",
+  chain_ref: "8453",
+  signer: tx.from,
+  broadcaster: "wallet",
+  state: "needs_signature",
+  transaction_id: null,
+  failure_code: null,
+  batch: {
+    batch_id: "batch-1",
+    index,
+    ordered_stage_ids: ["evm:1", "evm:2"],
+    ordered_commit_ids: ["commit-1", "commit-2"],
+    sources: [
+      {
+        thread_id: "thread-1",
+        chain_family: "evm",
+        chain_ref: "8453",
+        stage_id: `evm:${sourceId}`,
+        source_id: sourceId,
+      },
+    ],
+    predecessor_commit_id: index === 0 ? null : "commit-1",
+    review_digest: "review",
+  },
+  review: null,
+  wallet_attempt: null,
+  action: null,
+  ...patch,
+});
+
+describe("activity projection", () => {
+  it("binds cards to scoped durable sources without changing visual order", () => {
+    const supply = tool(2, "evm_stage_tx", {
+      ...tx,
+      label: "Supply USDC to Aave",
+      pending_tx_id: 2,
+      current_lifecycle: "queued",
+    });
+    const result = selectActivity(
+      [stage, supply],
+      [],
+      [durableCommit(1, 0), durableCommit(2, 1)],
+    );
+    expect(result.transactions.map((item) => item.commit?.commit_id)).toEqual([
+      "commit-1",
+      "commit-2",
+    ]);
+    expect(
+      result.transactions.every((item) => item.stage === "committed"),
+    ).toBe(true);
+    expect(
+      [...result.transactions]
+        .sort((a, b) => (b.sequence ?? 0) - (a.sequence ?? 0))
+        .map((item) => item.commit?.commit_id),
+    ).toEqual(["commit-2", "commit-1"]);
+  });
+
+  it("takes the family from the staged record, not the tool name", () => {
+    const evmApp = tool(1, "stage_jupiter_perps_order", {
+      staged: [{ ...tx, pending_tx_id: 1, current_lifecycle: "queued" }],
+    });
+    const solApp = tool(2, "stage_kamino_lend", {
+      staged: [
+        {
+          payer: "So1",
+          cluster: "mainnet-beta",
+          description: "Kamino deposit SOL",
+          pending_ix_id: 1,
+          current_lifecycle: "queued",
+          chain_kind: "svm",
+        },
+      ],
+    });
+    const result = selectActivity([evmApp, solApp], [], []);
+    expect(result.transactions.map((item) => item.family)).toEqual([
+      "evm",
+      "svm",
+    ]);
+  });
+
+  it("shows a Solana bundle as one transaction through simulate and commit", () => {
+    const stage = tool(1, "stage_jupiter_swap", {
+      staged: [
+        {
+          pending_ix_ids: [1, 2, 3],
+          instruction_count: 3,
+          cluster: "mainnet-beta",
+          description: "Swap SOL to USDC",
+          current_lifecycle: "queued",
+          chain_kind: "svm",
+        },
+      ],
+      pending_tx_ids: [1, 2, 3],
+    });
+    const sim = tool(2, "svm_simulate", {
+      ix_ids: [1, 2, 3],
+      simulation: { err: null },
+    });
+    const simulated = selectActivity([stage, sim]);
+    expect(
+      simulated.transactions.map((card) => [card.label, card.stage]),
+    ).toEqual([["Swap SOL to USDC", "simulated"]]);
+    const commit = durableCommit(1, 0, {
+      commit_id: "swap",
+      chain_family: "svm",
+      chain_ref: "mainnet-beta",
+      stage_id: "svm:1,2,3",
+      state: "confirmed",
+      batch: null,
+    });
+    const committed = selectActivity([stage, sim], [], [commit]);
+    expect(committed.transactions).toHaveLength(1);
+    expect(committed.transactions[0].commit?.state).toBe("confirmed");
+  });
+
+  it("binds an unbatched commit by its own stage id, also a later turn's", () => {
+    // As svm_stage_ix reports it; the commit tool's model-facing result names
+    // no sources, so the commit's own stage id is the link.
+    const solStage = (turn: string) =>
+      tool(
+        1,
+        "svm_stage_ix",
+        {
+          ix_ids: [1],
+          instructions: [
+            {
+              payer: "So1",
+              cluster: "mainnet-beta",
+              description: "Transfer SOL",
+              pending_ix_id: 1,
+              current_lifecycle: "queued",
+            },
+          ],
+        },
+        turn,
+      );
+    const parked = durableCommit(1, 0, {
+      commit_id: "sol-commit",
+      chain_family: "svm",
+      chain_ref: "mainnet-beta",
+      stage_id: "svm:1",
+      broadcaster: "hosted",
+      state: "awaiting_approval",
+      batch: null,
+    });
+    const now = selectActivity([solStage("turn-1")], [], [parked]);
+    expect(now.transactions[0]).toMatchObject({
+      label: "Transfer SOL",
+      stage: "committed",
+      commit: { commit_id: "sol-commit" },
+    });
+    // Two staged instructions committed as one transaction: both cards follow it.
+    const second = tool(2, "svm_stage_ix", {
+      ix_ids: [2],
+      instructions: [
+        {
+          payer: "So1",
+          cluster: "mainnet-beta",
+          description: "Transfer SOL back",
+          pending_ix_id: 2,
+          current_lifecycle: "queued",
+        },
+      ],
+    });
+    const both = selectActivity(
+      [solStage("turn-1"), second],
+      [],
+      [{ ...parked, stage_id: "svm:1,2", state: "confirmed" }],
+    );
+    expect(
+      both.transactions.map((card) => [card.label, card.commit?.state]),
+    ).toEqual([
+      ["Transfer SOL", "confirmed"],
+      ["Transfer SOL back", "confirmed"],
+    ]);
+    const later = selectActivity(
+      [
+        solStage("turn-1"),
+        {
+          ...meta(9, "turn-2"),
+          type: "message",
+          sender: "user",
+          content: "next",
+        } as Event,
+      ],
+      [],
+      [{ ...parked, state: "confirmed" }],
+    );
+    expect(later.history[0].commit?.state).toBe("confirmed");
+  });
+
+  it("lists every tx a protocol staging tool staged, then marks them simulated", () => {
+    const record = (pending_tx_id: number, label: string) => ({
+      pending_tx_id,
+      current_lifecycle: "queued",
+      chain_id: 8453,
+      label,
+      kind: "contract_call",
+      chain_kind: "evm",
+    });
+    const staged = tool(1, "stage_lifi_swap", {
+      route: "across",
+      staged: [record(1, "Approve USDC"), record(2, "Swap USDC to WETH")],
+      pending_tx_ids: [1, 2],
+    });
+    const result = selectActivity([staged]);
+    expect(result.transactions.map((item) => item.label).sort()).toEqual([
+      "Approve USDC",
+      "Swap USDC to WETH",
+    ]);
+    expect(result.transactions.every((item) => item.stage === "staged")).toBe(
+      true,
+    );
+    const sim = tool(2, "evm_simulate", {
+      resolved_ids: [1, 2],
+      simulation: { batch_success: true },
+    });
+    expect(
+      selectActivity([staged, sim]).transactions.map((item) => item.stage),
+    ).toEqual(["simulated", "simulated"]);
+  });
+
+  it("rejects a source binding with a different durable chain scope", () => {
+    const mismatched = durableCommit(1, 0);
+    mismatched.batch!.sources[0].chain_ref = "1";
+    expect(
+      selectActivity([stage], [], [mismatched]).transactions[0].commit,
+    ).toBeUndefined();
+  });
+
+  it("tracks stage, simulation and commit without fabricating an Action", () => {
+    expect(selectActivity([stage]).transactions[0].stage).toBe("staged");
+    const sim = tool(2, "evm_simulate_batch", {
+      resolved_ids: [1],
+      simulation: { batch_success: true },
+    });
+    expect(selectActivity([stage, sim]).transactions[0].stage).toBe(
+      "simulated",
+    );
+    const commit = tool(3, "evm_commit_txs", {
+      tx_ids: [1],
+      status: "pending_approval",
+    });
+    const state = selectActivity([stage, sim, commit]);
+    expect(state.transactions).toHaveLength(1);
+    expect(state.transactions[0].stage).toBe("committed");
+    expect(state.transactions[0].action).toBeUndefined();
+  });
+  it("reconciles an Action by exact payload and preserves latest rejection on replay", () => {
+    const state = selectActivity([
+      action(4, { state: "rejected", revision: 2 }),
+      stage,
+      action(2),
+    ]);
+    expect(state.transactions).toHaveLength(1);
+    expect(state.transactions[0].action?.state).toBe("rejected");
+  });
+  it("does not combine different payloads with the same name", () => {
+    const other = action(2);
+    if (other.request.type === "execute_evm")
+      other.request.transactions = [{ ...tx, to: "0x999" }];
+    expect(selectActivity([stage, other]).transactions).toHaveLength(2);
+  });
+  it("handles repeated identical transactions one-to-one", () => {
+    const batch = action(3);
+    if (batch.request.type === "execute_evm")
+      batch.request.transactions = [tx, tx];
+    const stage2 = tool(2, "evm_stage_tx", {
+      ...tx,
+      pending_tx_id: 2,
+      current_lifecycle: "queued",
+    });
+    expect(selectActivity([stage, stage2, batch]).transactions).toHaveLength(2);
+  });
+  it("keeps failed simulation scoped to the affected IDs and allows a successful retry", () => {
+    const failed = tool(2, "evm_simulate_batch", {
+      resolved_ids: [1],
+      simulation: { batch_success: false },
+    });
+    expect(selectActivity([stage, failed]).transactions[0].stage).toBe(
+      "simulation-failed",
+    );
+    expect(
+      selectActivity([
+        stage,
+        failed,
+        tool(3, "evm_simulate_batch", {
+          resolved_ids: [1],
+          simulation: { batch_success: true },
+        }),
+      ]).transactions[0].stage,
+    ).toBe("simulated");
+  });
+  it("starts a new turn cleanly but retains an unresolved wallet request", () => {
+    const user: Event = {
+      ...meta(3, "turn-2"),
+      type: "message",
+      sender: "user",
+      content: "Next request",
+    };
+    const state = selectActivity([stage, action(2), user, action(4)]);
+    expect(state.turnId).toBe("turn-2");
+    expect(state.transactions).toHaveLength(1);
+    expect(selectActivity([stage, user]).transactions).toHaveLength(0);
+    expect(selectActivity([]).transactions).toHaveLength(0);
+  });
+  it("deduplicates successful skill activation and excludes failed activations", () => {
+    const activated = tool(1, "activate_skill", {
+      activated: ["common_erc20", "lifi_swap"],
+    });
+    expect(
+      selectActivity([
+        activated,
+        activated,
+        tool(2, "activate_skill", { error: "failed", activated: ["other"] }),
+      ]).skills,
+    ).toEqual(["common_erc20", "lifi_swap"]);
+  });
+  it("never promotes truncated child tool previews to wallet transactions", () => {
+    const event: Event = {
+      ...meta(1),
+      type: "task_activity",
+      call_id: "call-1",
+      agent_id: "child",
+      child_seq: 1,
+      kind: "tool_call",
+      tool_name: "evm_stage_tx",
+      args: {},
+      result_preview: JSON.stringify({
+        ...tx,
+        pending_tx_id: 1,
+        current_lifecycle: "queued",
+      }),
+    };
+    expect(selectActivity([event]).transactions).toHaveLength(0);
+  });
+});
+
+describe("SVM preparation", () => {
+  it("reconciles a staged blob and its one-id simulation with the wallet Action", () => {
+    const blob = {
+      payer: "wallet",
+      cluster: "mainnet-beta",
+      version: "v0",
+      instructions: [],
+      description: "Jupiter swap",
+      kind: "swap",
+      unsigned_transaction_base64: "YWJj",
+      pending_tx_id: 1,
+      current_lifecycle: "queued",
+    };
+    const staged = tool(1, "svm_stage_tx", { tx: blob, pending_tx_id: 1 });
+    const sim = tool(2, "svm_simulate", {
+      tx_id: 1,
+      simulation: { err: null, units_consumed: 1200 },
+    });
+    expect(selectActivity([staged, sim]).transactions[0].stage).toBe(
+      "simulated",
+    );
+    const committed = action(3, {
+      request: {
+        type: "execute_svm",
+        transactions: [blob],
+        simulation: {
+          status: "passed",
+          balanceChanges: [],
+          approvals: [],
+          fees: [],
+          warnings: [],
+          guards: [],
+          logs: [],
+          gas: null,
+        },
+      },
+    });
+    expect(selectActivity([staged, sim, committed]).transactions).toHaveLength(
+      1,
+    );
+  });
+  it("collapses staged instructions into the assembled transaction", () => {
+    const ix = {
+      payer: "wallet",
+      cluster: "mainnet-beta",
+      program_id: "program",
+      data_base64: "YWJj",
+      accounts: [],
+      description: "Transfer",
+      pending_ix_id: 1,
+      current_lifecycle: "queued",
+    };
+    const staged = tool(1, "svm_stage_ix", { ix_ids: [1], instructions: [ix] });
+    const committed = action(2, {
+      request: {
+        type: "execute_svm",
+        transactions: [
+          {
+            payer: "wallet",
+            cluster: "mainnet-beta",
+            version: "v0",
+            description: "svm bundle of 1 instructions",
+            kind: "transfer",
+            instructions: [
+              {
+                program_id: "program",
+                data_base64: "YWJj",
+                accounts: [],
+                description: "Transfer SOL",
+              } as never,
+            ],
+          },
+        ],
+        simulation: {
+          status: "passed",
+          balanceChanges: [],
+          approvals: [],
+          fees: [],
+          warnings: [],
+          guards: [],
+          logs: [],
+          gas: null,
+        },
+      },
+    });
+    expect(selectActivity([staged, committed]).transactions).toHaveLength(1);
+    expect(selectActivity([staged, committed]).transactions[0].label).toBe(
+      "Transfer SOL",
+    );
+    expect(selectActivity([committed]).transactions[0].label).toBe(
+      "Transfer SOL",
+    );
+    const unnamed = structuredClone(committed);
+    if (unnamed.request.type !== "execute_svm")
+      throw new Error("Expected Solana fixture");
+    unnamed.request.transactions[0].description = "";
+    // Historical action events may predate required instruction descriptions.
+    delete (
+      unnamed.request.transactions[0].instructions[0] as {
+        description?: string;
+      }
+    ).description;
+    expect(selectActivity([staged, unnamed]).transactions[0].label).toBe(
+      "Transfer",
+    );
+    const duplicate = tool(2, "svm_stage_ix", {
+      ix_ids: [2],
+      instructions: [{ ...ix, pending_ix_id: 2 }],
+    });
+    const repeated = selectActivity([
+      staged,
+      duplicate,
+      { ...committed, sequence: 3 },
+    ]).transactions;
+    expect(repeated).toHaveLength(2);
+    expect(repeated.filter((tx) => tx.action)).toHaveLength(1);
+
+    const durable = durableCommit(1, 0, {
+      stage_id: "svm:1",
+      chain_family: "svm",
+      chain_ref: "mainnet-beta",
+      signer: "wallet",
+      state: "expired",
+    });
+    durable.batch!.sources = [
+      {
+        thread_id: durable.thread_id,
+        chain_family: "svm",
+        chain_ref: "mainnet-beta",
+        stage_id: "svm:1",
+        source_id: 1,
+      },
+    ];
+    const durableActivity = selectActivity(
+      [staged, committed],
+      [committed],
+      [durable],
+    );
+    expect(durableActivity.transactions[0].commit).toBe(durable);
+    expect(
+      selectLegacyReviewAction([staged, committed], [committed], [durable]),
+    ).toBeUndefined();
+  });
+});
+
+describe("message commits", () => {
+  it("lists each family's message commit as its own row", () => {
+    const review = (family: "evm" | "svm") => ({
+      version: 1,
+      revision: 1,
+      digest: "review",
+      legs: [],
+      request: {
+        type: "sign" as const,
+        requestId: `${family}-message:1`,
+        chainFamily: family,
+        executionKind: `${family}_message`,
+        signer: "wallet",
+        description: `Sign on ${family}`,
+        payloads: [],
+      },
+    });
+    const commits = [
+      durableCommit(1, 0, { batch: null, review: review("evm") }),
+      durableCommit(2, 0, {
+        batch: null,
+        chain_family: "svm",
+        chain_ref: "mainnet-beta",
+        review: review("svm"),
+      }),
+    ];
+    expect(
+      selectActivity([], [], commits).transactions.map(
+        ({ family, label, kind, cluster }) => ({
+          family,
+          label,
+          kind,
+          cluster,
+        }),
+      ),
+    ).toEqual([
+      {
+        family: "evm",
+        label: "Sign on evm",
+        kind: "message",
+        cluster: undefined,
+      },
+      {
+        family: "svm",
+        label: "Sign on svm",
+        kind: "message",
+        cluster: "mainnet-beta",
+      },
+    ]);
+  });
+});
+
+describe("thread-wide activity", () => {
+  it("retains skills and subagents after a new user turn", () => {
+    const events: Event[] = [
+      tool(1, "activate_skill", { activated: ["aave", "common_erc20"] }),
+      {
+        ...meta(2),
+        type: "task_started",
+        call_id: "call",
+        agent_id: "agent",
+        label: "Find route",
+        app: "swap",
+        resumed: false,
+      } as Event,
+      {
+        ...meta(3),
+        type: "task_completed",
+        call_id: "call",
+        agent_id: "agent",
+        status: "completed",
+        message: "Done",
+        staged_count: 0,
+        steps: 1,
+        duration_ms: 1,
+      } as Event,
+      {
+        ...meta(4, "turn-2"),
+        type: "message",
+        sender: "user",
+        content: "Next",
+      } as Event,
+      tool(5, "activate_skill", { activated: ["aave"] }, "turn-2"),
+    ];
+    const result = selectActivity(events);
+    expect(result.skills).toEqual(["aave", "common_erc20"]);
+    expect(result.agents).toHaveLength(1);
+    expect(result.agents[0].label).toBe("Find route");
+    expect(result.agents[0].status).toBe("completed");
+  });
+  it("keeps repeated transfers and reused stage IDs distinct across turns", () => {
+    const first = action(2, { state: "completed" });
+    const secondStage = tool(
+      5,
+      "evm_stage_tx",
+      { ...tx, pending_tx_id: 1, current_lifecycle: "queued" },
+      "turn-2",
+    );
+    const second = action(6, { id: "a2", turn_id: "turn-2" });
+    const result = selectActivity(
+      [stage, first, secondStage, second],
+      [second],
+    );
+    expect(result.history).toHaveLength(1);
+    expect(result.history[0].action?.id).toBe("a1");
+    expect(result.transactions).toHaveLength(1);
+    expect(result.transactions[0].action?.id).toBe("a2");
+    expect(result.transactions[0].sequence).toBeGreaterThan(
+      result.history[0].sequence!,
+    );
+  });
+  it("does not promote an old transaction when a later result revision arrives", () => {
+    const old = action(2);
+    const newer = action(5, { id: "a2", turn_id: "turn-2" });
+    const result = selectActivity(
+      [old, newer, { ...old, sequence: 8, revision: 2, state: "completed" }],
+      [newer],
+    );
+    expect(result.history[0].sequence).toBe(2);
+    expect(
+      result.transactions.find((tx) => tx.action?.id === "a2")?.sequence,
+    ).toBe(5);
+  });
+
+  it("shows only the visible conversation's work after an Edit or Rerun", () => {
+    const user = (sequence: number, turn: string): Event => ({
+      ...meta(sequence, turn),
+      type: "message",
+      sender: "user",
+      message_key: `${turn}:user`,
+      content: "Swap",
+    });
+    const subagent = (sequence: number, turn: string, agent: string): Event =>
+      ({
+        ...meta(sequence, turn),
+        type: "task_started",
+        call_id: agent,
+        agent_id: agent,
+        label: agent,
+        app: "swap",
+        resumed: false,
+      }) as Event;
+    const replaced: Event[] = [
+      user(1, "turn-1"),
+      tool(2, "activate_skill", { activated: ["aave"] }),
+      subagent(3, "turn-1", "old-agent"),
+      tool(4, "evm_stage_tx", {
+        ...tx,
+        pending_tx_id: 1,
+        current_lifecycle: "queued",
+      }),
+      action(5, { state: "completed" }),
+    ];
+    const branch: Event = {
+      ...meta(6, "turn-2"),
+      type: "branch",
+      kind: "regenerate",
+      target_message_key: "turn-1:user",
+      user_message_key: "turn-1:user",
+      content: "Swap",
+      removed_message_keys: ["turn-1:user"],
+      removed_turn_ids: ["turn-1"],
+    };
+    expect(
+      selectActivity(projectConversationEvents([...replaced, branch])),
+    ).toMatchObject({ agents: [], skills: [], transactions: [], history: [] });
+
+    const visible = selectActivity(
+      projectConversationEvents([
+        ...replaced,
+        branch,
+        user(7, "turn-2"),
+        tool(8, "activate_skill", { activated: ["lifi"] }, "turn-2"),
+        subagent(9, "turn-2", "new-agent"),
+        tool(
+          10,
+          "evm_stage_tx",
+          { ...tx, pending_tx_id: 1, current_lifecycle: "queued" },
+          "turn-2",
+        ),
+      ]),
+    );
+    expect(visible.skills).toEqual(["lifi"]);
+    expect(visible.agents.map((agent) => agent.agentId)).toEqual(["new-agent"]);
+    expect(visible.transactions.map((item) => item.turnId)).toEqual(["turn-2"]);
+    expect(visible.history).toEqual([]);
+  });
+});
+
+describe("selectReviewQueue", () => {
+  const member = (index: number, patch: Partial<CommitView> = {}) =>
+    ({
+      version: 1,
+      commit_id: `cmt-${index}`,
+      thread_id: "thread",
+      stage_id: `evm:${index}`,
+      chain_family: "evm",
+      chain_ref: "8453",
+      signer: "0x1111111111111111111111111111111111111111",
+      broadcaster: "wallet",
+      state: "needs_signature",
+      transaction_id: null,
+      failure_code: null,
+      review: null,
+      wallet_attempt: null,
+      action: null,
+      batch: {
+        batch_id: "batch",
+        index,
+        ordered_stage_ids: ["evm:0", "evm:1"],
+        ordered_commit_ids: ["cmt-0", "cmt-1"],
+        sources: [],
+        predecessor_commit_id: index ? "cmt-0" : null,
+        review_digest: "digest",
+      },
+      ...patch,
+    }) as CommitView;
+  // A queue over a controller whose groups are atomic or not.
+  const queue = (commits: CommitView[], atomic: boolean) =>
+    selectReviewQueue(commits, {
+      review: () => ({}) as never,
+      plan: () => ({ transport: "send_calls", prompts: 1, atomic }),
+    });
+
+  it("shows an atomic group by its leader alone", () => {
+    const leader = member(0);
+    const later = member(1);
+    expect(queue([leader, later], true)).toEqual([leader]);
+    expect(queue([leader, later], false)).toEqual([leader, later]);
+    // Once the bundle is out, the group leaves the queue.
+    expect(queue([{ ...leader, state: "submitted" }, later], true)).toEqual([]);
+  });
+
+  it("steps through groups in order across chains", () => {
+    const other = (index: number) =>
+      member(index, {
+        commit_id: `base-${index}`,
+        chain_ref: "1",
+        batch: {
+          ...member(index).batch!,
+          batch_id: "other",
+          ordered_commit_ids: ["base-0", "base-1"],
+        },
+      });
+    const commits = [member(0), member(1), other(0), other(1)];
+    expect(queue(commits, true).map((view) => view.commit_id)).toEqual([
+      "cmt-0",
+      "base-0",
+    ]);
+    expect(
+      queue([...commits].reverse(), false).map((view) => view.commit_id),
+    ).toEqual(["base-0", "base-1", "cmt-0", "cmt-1"]);
+  });
+
+  it("keeps an older lone commit ahead of a newer batch", () => {
+    const lone = member(0, { commit_id: "lone", batch: null });
+    expect(
+      queue([lone, member(1), member(0)], false).map((view) => view.commit_id),
+    ).toEqual(["lone", "cmt-0", "cmt-1"]);
+  });
+});
+
+describe("discarded staged transactions", () => {
+  const evm = (sequence: number, id: number, turn = "turn-1") =>
+    tool(
+      sequence,
+      "evm_stage_tx",
+      {
+        ...tx,
+        pending_tx_id: id,
+        current_lifecycle: "queued",
+      },
+      turn,
+    );
+  const svm = (sequence: number, id: number, lane: "ix" | "tx") =>
+    tool(sequence, `svm_stage_${lane}`, {
+      [lane]: {
+        [lane === "ix" ? "pending_ix_id" : "pending_tx_id"]: id,
+        current_lifecycle: "queued",
+        cluster: "devnet",
+        description: `Solana draft ${id}`,
+      },
+    });
+
+  it.each(["message", "tool_complete", "tool_update"] as const)(
+    "removes only returned EVM ids from %s events, including earlier turns and replay",
+    (type) => {
+      const events: Event[] = [evm(1, 1), evm(2, 2), svm(3, 1, "ix")];
+      expect(selectActivity(events).transactions).toHaveLength(3);
+      const result = { __aomi_tool_value: { discarded: [1] } };
+      const discard: Event =
+        type === "message"
+          ? tool(4, "evm_discard_tx", result, "turn-2")
+          : ({
+              ...meta(4, "turn-2"),
+              type,
+              id: "discard-1",
+              tool_name: "evm_discard_tx",
+              result,
+            } as Event);
+      events.push(discard);
+      const selected = selectActivity(events);
+      expect(
+        [...selected.history, ...selected.transactions].map((item) => item.id),
+      ).toEqual(["turn-1:evm:2", "turn-1:svm:1"]);
+      expect(selectActivity(JSON.parse(JSON.stringify(events)))).toEqual(
+        selected,
+      );
+    },
+  );
+
+  it("removes both SVM lanes while preserving an EVM draft with the same id", () => {
+    const events = [evm(1, 1), svm(2, 1, "ix"), svm(3, 2, "tx")];
+    expect(selectActivity(events).transactions).toHaveLength(3);
+    events.push(tool(4, "svm_discard_tx", { discarded: [1, 2] }));
+    expect(selectActivity(events).transactions.map((item) => item.id)).toEqual([
+      "turn-1:evm:1",
+    ]);
+  });
+
+  it("removes legacy Jupiter drafts by their staged ids across turns and replay", () => {
+    const events = [
+      tool(1, "jupiter_prepare_swap", {
+        ix_ids: [1, 2],
+        cluster: "mainnet-beta",
+      }),
+      evm(2, 1),
+      tool(3, "svm_discard_tx", { discarded: [1] }, "turn-2"),
+    ];
+    const selected = selectActivity(events);
+    expect(
+      [...selected.history, ...selected.transactions].map((item) => item.id),
+    ).toEqual(["turn-1:svm:2", "turn-1:evm:1"]);
+    expect(selectActivity(JSON.parse(JSON.stringify(events)))).toEqual(
+      selected,
+    );
+  });
+
+  it("keeps drafts for failed or incomplete discards and ignores lookalike tools", () => {
+    for (const [name, result] of [
+      ["evm_discard_tx", { is_error: true, discarded: [1] }],
+      ["evm_discard_tx", { error: "unknown id", discarded: [1] }],
+      ["evm_discard_tx", {}],
+      ["skill_tools::evm_discard_tx", { discarded: [1] }],
+    ] as const) {
+      expect(
+        selectActivity([evm(1, 1), tool(2, name, result)]).transactions,
+      ).toHaveLength(1);
+    }
+  });
+
+  it("removes a draft left by a rejected commit when the backend confirms its discard", () => {
+    const events = [
+      evm(1, 1),
+      tool(2, "evm_commit_txs", { status: "pending_approval", tx_ids: [1] }),
+      tool(3, "evm_discard_tx", { discarded: [1] }),
+    ];
+    expect(selectActivity(events).transactions).toEqual([]);
+  });
+
+  it("keeps committed history and allows a new draft after a discard", () => {
+    const events = [
+      evm(1, 1),
+      tool(2, "evm_commit_txs", { status: "pending_approval", tx_ids: [1] }),
+      evm(3, 2),
+      tool(4, "evm_discard_tx", { discarded: [2] }),
+      evm(5, 3),
+    ];
+    expect(selectActivity(events).transactions.map((item) => item.id)).toEqual([
+      "turn-1:evm:1",
+      "turn-1:evm:3",
+    ]);
+  });
+});
+
+describe("selectPolicyChangeIds", () => {
+  const propose = (
+    sequence: number,
+    waiting: object | null,
+    name = "rules_propose",
+  ) =>
+    tool(sequence, name, {
+      status: waiting ? "waiting" : "applied",
+      waiting_for_admin: waiting,
+    });
+
+  it("lists the changes the agent filed and left waiting, oldest first, once each", () => {
+    const events: Event[] = [
+      propose(1, { id: "c1" }),
+      propose(2, null),
+      propose(3, { id: "c2" }),
+      propose(4, { id: "c1" }),
+    ];
+    expect(selectPolicyChangeIds(events)).toEqual(["c1", "c2"]);
+  });
+
+  it("ignores other tools, even when they carry a waiting change", () => {
+    expect(
+      selectPolicyChangeIds([propose(1, { id: "c1" }, "rules_get")]),
+    ).toEqual([]);
+  });
+});
+
+describe("selectPolicyFilings", () => {
+  const filed = (sequence: number, wallet: string | null, name: string) =>
+    tool(sequence, name, wallet ? { agent_wallet_id: wallet } : {});
+
+  it("lists the wallet of every rules_propose and rules_tighten result, once per filing", () => {
+    const events: Event[] = [
+      filed(1, "w1", "rules_propose"),
+      filed(2, "w1", "rules_tighten"),
+      filed(3, "w2", "rules_propose"),
+      filed(4, null, "rules_propose"),
+      filed(5, "w3", "rules_get"),
+    ];
+    expect(selectPolicyFilings(events)).toEqual(["w1", "w1", "w2"]);
+  });
+});

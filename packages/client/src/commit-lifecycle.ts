@@ -1,0 +1,256 @@
+import type { ActionRequest } from "./agent/types";
+import type {
+  CommitRecoveryRecord,
+  CommitSubmissionPhase,
+  CommitView,
+  MessageCommitReview,
+  OnChainOutcome,
+} from "./commits";
+
+export type CommitPresentation = {
+  phase:
+    | "ready"
+    | "awaiting_approval"
+    | "signing"
+    | "waiting_predecessor"
+    | "unavailable"
+    | "preparing"
+    | "switching_chain"
+    | "awaiting_wallet"
+    | "checking_submission"
+    | "submitted"
+    | "confirmed"
+    | "rejected"
+    | "failed"
+    | "expired";
+  label: string;
+  transactionId?: string;
+  /** Set when the chain's receipt, not Commit Service, supplies the label.
+   * The phase stays `submitted`; Commit Service's terminal state replaces it. */
+  onChain?: OnChainOutcome;
+};
+
+/** A message commit's review: a `sign` request for an `evm_message` or an
+ * `svm_message`. */
+export function isMessageReview(
+  review: ActionRequest | undefined,
+): review is MessageCommitReview {
+  return (
+    review?.type === "sign" &&
+    (review.executionKind === "evm_message" ||
+      review.executionKind === "svm_message")
+  );
+}
+
+/** An off-chain message signature: nothing is sent, so a confirmed one has a
+ * `signature` and no transaction. */
+export function isMessageCommit(view: CommitView): boolean {
+  return (
+    isMessageReview(view.review?.request) ||
+    (view.action?.kind === "sign" &&
+      (view.action.payload.kind === "evm_message" ||
+        view.action.payload.kind === "svm_message")) ||
+    typeof view.signature === "string"
+  );
+}
+
+/** Consumes only eligibility facts already present in a review. The current
+ * wire contract does not say whether simulation/guards were required when
+ * `simulation` is absent; the client must leave that case to server admission
+ * rather than invent an eligibility rule. An empty guard list is not a blocker. */
+export function reviewEligibility(
+  request: ActionRequest | undefined,
+):
+  | { state: "eligible" | "blocked" | "unresolved"; reason?: string }
+  | undefined {
+  if (request?.transactionSafety) {
+    const { decision, authority } = request.transactionSafety;
+    const eligibility =
+      authority.eligibility !== "eligible"
+        ? authority.eligibility
+        : decision.eligibility;
+    return {
+      state: eligibility === "waiting" ? "unresolved" : eligibility,
+      reason:
+        eligibility === "eligible"
+          ? undefined
+          : authority.eligibility !== "eligible"
+            ? authority.reasonCode
+            : decision.reasonCode,
+    };
+  }
+  if (!request || request.type === "sign" || !request.simulation)
+    return undefined;
+  const simulation = request.simulation;
+  const failedGuard = simulation.guards.find(
+    (guard) => guard.status === "failed",
+  );
+  if (failedGuard)
+    return {
+      state: "blocked",
+      reason: failedGuard.message ?? `${failedGuard.name} blocked execution`,
+    };
+  if (simulation.status === "failed")
+    return { state: "blocked", reason: "Simulation failed" };
+  if (
+    simulation.status !== "passed" ||
+    simulation.guards.some(
+      (guard) => !["passed", "warning"].includes(guard.status),
+    )
+  )
+    return {
+      state: "unresolved",
+      reason: "Execution eligibility is unresolved",
+    };
+  return { state: "eligible" };
+}
+
+/** One semantic projection for transcript, review, and activity surfaces.
+ * `awaiting_wallet` in a durable record means the attempt exists; after a
+ * reload it does not prove that a provider prompt is still open. */
+export function projectCommitLifecycle(
+  view: CommitView,
+  phase?: CommitSubmissionPhase,
+  recovery?: CommitRecoveryRecord,
+  onChain?: OnChainOutcome,
+): CommitPresentation {
+  if (isMessageCommit(view)) return projectMessageLifecycle(view, phase);
+  const transactionId =
+    view.transaction_id ??
+    view.wallet_attempt?.transaction_id ??
+    recovery?.transactionId ??
+    recovery?.transactionIds?.at(-1) ??
+    undefined;
+  if (view.state === "confirmed")
+    return { phase: "confirmed", label: "Confirmed", transactionId };
+  if (view.state === "rejected") {
+    const rejectionPhase = view.wallet_attempt?.phase;
+    const label =
+      view.wallet_attempt?.reason_category === "user_rejected"
+        ? rejectionPhase === "chain_switch"
+          ? "Wallet rejected the network switch"
+          : rejectionPhase === "transaction_request"
+            ? "Wallet rejected the transaction request"
+            : "Wallet rejected the request"
+        : view.wallet_attempt
+          ? "Wallet request rejected"
+          : view.approval?.state === "cancelled"
+            ? "Cancelled · nothing was signed"
+            : "Request rejected";
+    return { phase: "rejected", label, transactionId };
+  }
+  if (view.state === "failed")
+    return {
+      phase: "failed",
+      label: view.failure_code
+        ? `Transaction failed: ${view.failure_code}`
+        : "Transaction failed",
+      transactionId,
+    };
+  if (view.state === "expired")
+    return {
+      phase: "expired",
+      label:
+        view.approval?.state === "expired"
+          ? "Expired · nothing was signed"
+          : "Request expired",
+      transactionId,
+    };
+  if (view.state === "awaiting_approval")
+    return { phase: "awaiting_approval", label: "Waiting for your approval" };
+  // The chain's receipt, until Commit Service settles. It never outranks a
+  // terminal state above, and a mismatched attempt drops it.
+  if (onChain && view.wallet_attempt?.state !== "mismatched")
+    return {
+      phase: "submitted",
+      label: onChain === "success" ? "Confirmed on chain" : "Failed on chain",
+      transactionId,
+      onChain,
+    };
+  if (view.state === "submitted")
+    return {
+      phase: "submitted",
+      label: "Submitted; confirming",
+      transactionId,
+    };
+  if (view.wallet_attempt?.state === "mismatched")
+    return {
+      phase: "failed",
+      label: "Submitted transaction did not match the reviewed request",
+      transactionId,
+    };
+  if (
+    view.wallet_attempt?.state === "reported" ||
+    view.wallet_attempt?.state === "observing"
+  )
+    return {
+      phase: "submitted",
+      label: "Submitted; confirming",
+      transactionId,
+    };
+  if (phase === "switching_chain")
+    return { phase, label: "Switch network in your wallet", transactionId };
+  if (phase === "awaiting_wallet")
+    return { phase, label: "Approve in your wallet", transactionId };
+  if (phase === "submitting")
+    return {
+      phase: "preparing",
+      label: "Submitting transaction",
+      transactionId,
+    };
+  if (phase === "preparing")
+    return { phase, label: "Preparing wallet request", transactionId };
+  if (view.wallet_attempt || recovery?.attemptId)
+    return {
+      phase: "checking_submission",
+      label: "Wallet outcome unknown; check status before submitting again",
+      transactionId,
+    };
+  // Approved: Aomi signs with the agent wallet; nothing for the browser to do.
+  if (view.approval?.state === "approved" && view.state === "needs_signature")
+    return { phase: "signing", label: "Signing…" };
+  if (!view.action && view.batch?.predecessor_commit_id)
+    return {
+      phase: "waiting_predecessor",
+      label: "Waiting for previous transaction",
+    };
+  if (!view.action)
+    return { phase: "unavailable", label: "Transaction not ready" };
+  return { phase: "ready", label: "Ready to submit" };
+}
+
+/** A message has no wallet attempt, broadcast or transaction: it is signed
+ * (by Aomi, or the wallet through `sign`) or it is not. */
+function projectMessageLifecycle(
+  view: CommitView,
+  phase?: CommitSubmissionPhase,
+): CommitPresentation {
+  switch (view.state) {
+    case "confirmed":
+      return { phase: "confirmed", label: "Signed" };
+    case "rejected":
+      return {
+        phase: "rejected",
+        label:
+          view.approval?.state === "cancelled"
+            ? "Cancelled · nothing was signed"
+            : "Request rejected",
+      };
+    case "failed":
+      return {
+        phase: "failed",
+        label: view.failure_code
+          ? `Signature failed: ${view.failure_code}`
+          : "Signature failed",
+      };
+    case "expired":
+      return { phase: "expired", label: "Expired · nothing was signed" };
+    case "awaiting_approval":
+      return { phase: "awaiting_approval", label: "Waiting for your approval" };
+  }
+  // The only local step is the wallet's own signature prompt.
+  if (phase) return { phase: "awaiting_wallet", label: "Sign in your wallet" };
+  if (view.approval?.state === "approved" || !view.action)
+    return { phase: "signing", label: "Signing…" };
+  return { phase: "ready", label: "Ready to sign" };
+}

@@ -1,0 +1,127 @@
+import type { DeployErrorDetail } from "@aomi-labs/deploy";
+
+export type AppService = "portal" | "build";
+
+export type AppUpstream = "rust" | "github" | "vercel" | "supabase";
+
+export type FailureAction = "issue" | "log" | "ignore";
+
+export type FailureReason =
+  | "expected"
+  | "local_exception"
+  | "upstream_request_failed"
+  | "upstream_response_failed"
+  | "service_credential_rejected"
+  | "invalid_upstream_status";
+
+export type PublicFailure = {
+  status: number;
+  error: string;
+  /**
+   * Stable machine-readable identifier for the failure, when the caller needs
+   * to branch on it. The human message is not a contract; this is.
+   */
+  code?: string;
+  /**
+   * Whether retrying the same request could plausibly succeed. `false` marks
+   * an operator problem (a missing deploy-time credential, say) where telling
+   * the user to try again is the wrong instruction.
+   */
+  retryable?: boolean;
+  /**
+   * Public fields from the Manager's structured deploy failure. Internal
+   * diagnostic details stay behind the app server boundary.
+   */
+  deployError?: DeployErrorDetail;
+};
+
+export type LocalDiagnosticValue = string | number | boolean | null;
+
+export type LocalDiagnostic = {
+  kind: string;
+  attributes?: Record<string, LocalDiagnosticValue>;
+};
+
+export type FailureContext = {
+  routeFamily: string;
+  operation: string;
+  method?: string;
+  durationMs?: number;
+  smokeTest?: boolean;
+};
+
+type ContextualFailure = { context: FailureContext };
+
+export type FailureInput =
+  | (ContextualFailure & {
+      source: "expected";
+      error?: unknown;
+      response: PublicFailure;
+      localDiagnostic?: LocalDiagnostic;
+    })
+  | (ContextualFailure & {
+      source: "local";
+      error: unknown;
+      response?: PublicFailure;
+      handled?: boolean;
+    })
+  | (ContextualFailure & {
+      source: "upstream_request";
+      upstream: AppUpstream;
+      error: unknown;
+      response?: PublicFailure;
+    })
+  | (ContextualFailure & {
+      source: "upstream_response";
+      upstream: AppUpstream;
+      status: number;
+      credential?: "service" | "user";
+      error?: unknown;
+      response?: PublicFailure;
+    })
+  | (ContextualFailure & {
+      source: "launch";
+      error: unknown;
+    })
+  | (ContextualFailure & {
+      source: "artifact";
+      error: unknown;
+    })
+  | (ContextualFailure & {
+      source: "uncaught";
+      error: unknown;
+    });
+
+export type IdentifiedFailure = {
+  origin: "expected" | "local" | "upstream_request" | "upstream_response";
+  error: unknown;
+  context: FailureContext;
+  handled: boolean;
+  upstream?: AppUpstream;
+  upstreamStatus?: number;
+  credential?: "service" | "user";
+  responseHint?: PublicFailure;
+  localDiagnostic?: LocalDiagnostic;
+};
+
+export type FailureDecision = {
+  action: FailureAction;
+  reason: FailureReason;
+  error: unknown;
+  context: FailureContext;
+  handled: boolean;
+  responseStatus: number;
+  responseError: string;
+  responseCode?: string;
+  responseRetryable?: boolean;
+  responseDeployError?: DeployErrorDetail;
+  upstream?: AppUpstream;
+  upstreamStatus?: number;
+  localDiagnostic?: LocalDiagnostic;
+};
+
+export type FailureResult = FailureDecision & { response: Response };
+
+export type FailurePipeline = {
+  handle(input: FailureInput): FailureResult;
+};

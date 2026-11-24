@@ -1,0 +1,1033 @@
+import { act, fireEvent, render } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ToolCallMessagePart } from "@assistant-ui/react";
+
+import type { Event } from "@aomi-labs/client";
+import type { TaskRunState } from "@aomi-labs/react";
+import { ChatViewContext } from "../../../react/src/state/use-chat-view";
+import { createChatViewStore } from "../../../react/src/state/chat-view-store";
+
+vi.mock("./markdown-text", async () => {
+  const { useMessagePartText } = await vi.importActual<
+    typeof import("@assistant-ui/react")
+  >("@assistant-ui/react");
+  return {
+    MarkdownText: () => {
+      const part = useMessagePartText();
+      return <span data-testid="rendered-text">{part.text}</span>;
+    },
+  };
+});
+
+import {
+  activeWorkDurationMs,
+  MinimalWorkingTrace,
+  RenderedText,
+  WorkingTrace,
+} from "./working-trace";
+import { buildTraceItems } from "@aomi-labs/client/trace";
+import { TraceAttributionContext } from "./trace-attribution";
+import { ToolStepRow } from "./working-trace-rows";
+
+const resizeCallbacks = new Map<Element, ResizeObserverCallback>();
+beforeEach(() => {
+  resizeCallbacks.clear();
+  vi.stubGlobal("ResizeObserver", class {
+    private targets = new Set<Element>();
+    constructor(private callback: ResizeObserverCallback) {}
+    observe(target: Element) {
+      this.targets.add(target);
+      resizeCallbacks.set(target, this.callback);
+    }
+    disconnect() {
+      for (const target of this.targets) resizeCallbacks.delete(target);
+    }
+  });
+});
+afterEach(() => vi.unstubAllGlobals());
+
+function publishBodyLayout(body: HTMLElement, height: number) {
+  act(() => resizeCallbacks.get(body)?.([
+    { target: body, borderBoxSize: [{ blockSize: height, inlineSize: 320 }] } as unknown as ResizeObserverEntry,
+  ], {} as ResizeObserver));
+}
+
+const run = (steps: TaskRunState["steps"]): TaskRunState => ({
+  agentId: "task-agent:9f2c1a2b3c4d",
+  callId: "call-1",
+  label: "swap-worker",
+  app: "default",
+  status: "running",
+  startedAt: Date.now(),
+  steps,
+});
+
+describe("WorkingTrace", () => {
+  it("shows active Working time and freezes the elapsed duration on completion", () => {
+    vi.useFakeTimers();
+    try {
+      const startedAtMs = Date.now() - 5_000;
+      const view = render(
+        <WorkingTrace
+          running
+          items={[{ kind: "note", key: "note", text: "Checking the request" }]}
+          revealed={1}
+          startedAtMs={startedAtMs}
+        />,
+      );
+      expect(view.getByLabelText("Working time")).toHaveTextContent("5s");
+      expect(view.getByLabelText("Working time")).toHaveClass(
+        "inline-flex",
+        "items-center",
+        "leading-none",
+      );
+      expect(view.getByText("1 step").className).toBe(
+        view.getByLabelText("Working time").className,
+      );
+      act(() => vi.advanceTimersByTime(2_000));
+      expect(view.getByLabelText("Working time")).toHaveTextContent("7s");
+      view.rerender(
+        <WorkingTrace
+          running={false}
+          items={[]}
+          revealed={0}
+          startedAtMs={startedAtMs}
+        />,
+      );
+      expect(view.queryByLabelText("Working time")).toBeNull();
+      expect(
+        view.getByRole("button", { name: /Worked for 7s/ }),
+      ).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not inflate the live count when the server clock runs behind", () => {
+    const now = Date.now();
+    const skew = 111 * 60_000;
+    // Stamped by a server clock 111 minutes behind this one.
+    const processing = (atMs: number): Event => ({
+      event_id: "event-1",
+      sequence: 1,
+      type: "turn_state_changed",
+      turn_id: "turn",
+      state: "processing",
+      occurred_at: (atMs - skew) / 1_000,
+    });
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(now);
+      const view = render(
+        <WorkingTrace
+          running
+          items={[]}
+          revealed={0}
+          phaseEvents={[]}
+          phaseTurnIds={["turn"]}
+        />,
+      );
+      view.rerender(
+        <WorkingTrace
+          running
+          items={[]}
+          revealed={0}
+          phaseEvents={[processing(now)]}
+          phaseTurnIds={["turn"]}
+        />,
+      );
+      act(() => vi.advanceTimersByTime(3_000));
+      expect(view.getByLabelText("Working time")).toHaveTextContent(/^3s$/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reconstructs active time across reload and pauses for wallet approval", () => {
+    const now = Date.now();
+    const seconds = (ms: number) => ms / 1_000;
+    const phase = (
+      sequence: number,
+      turnId: string,
+      state: "processing" | "awaiting_action",
+      atMs: number,
+    ): Event => ({
+      event_id: `event-${sequence}`,
+      sequence,
+      type: "turn_state_changed",
+      turn_id: turnId,
+      state,
+      occurred_at: seconds(atMs),
+    });
+    const events = [
+      phase(1, "turn", "processing", now - 100_000),
+      phase(2, "turn", "awaiting_action", now - 95_000),
+      phase(3, "callback", "processing", now - 2_000),
+    ];
+    expect(activeWorkDurationMs(events, ["turn", "callback"], now)).toBe(7_000);
+    expect(
+      activeWorkDurationMs(events.slice(0, 2), ["turn", "callback"], now),
+    ).toBe(5_000);
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(now);
+      const view = render(
+        <WorkingTrace
+          running
+          items={[]}
+          revealed={0}
+          phaseEvents={events}
+          phaseTurnIds={["turn", "callback"]}
+        />,
+      );
+      expect(view.getByLabelText("Working time")).toHaveTextContent("7s");
+      act(() => vi.advanceTimersByTime(2_000));
+      expect(view.getByLabelText("Working time")).toHaveTextContent("9s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps ownership and transaction facts without an overflow bubble", () => {
+    const { getByText, queryByText, container } = render(
+      <ToolStepRow
+        interpretation={{
+          icon: "tool",
+          title: "Commit transactions",
+          confidence: "high",
+          rawLabel: "evm_commit_txs",
+          failed: false,
+          outcome: "waiting",
+          chips: [
+            {
+              id: "app:hoodit",
+              attribution: "app",
+              label: "Hoodit",
+              icon: "app",
+            },
+            {
+              id: "skill:portfolio",
+              attribution: "skill",
+              label: "Portfolio",
+              icon: "skill:portfolio",
+            },
+            { label: "Arc", icon: "block", essential: true },
+            { label: "1 tx", icon: "receipt", essential: true },
+            { label: "Pending confirmation", icon: "pending", essential: true },
+            { label: "extra", icon: "gas" },
+            { label: "hidden", icon: "gas" },
+            { label: "iconless" },
+          ],
+        }}
+        done
+        active={false}
+        animate={false}
+      />,
+    );
+    for (const label of [
+      "Hoodit",
+      "Portfolio",
+      "Arc",
+      "1 tx",
+      "Pending confirmation",
+      "extra",
+    ]) {
+      expect(getByText(label)).toBeInTheDocument();
+    }
+    expect(queryByText("hidden")).not.toBeInTheDocument();
+    expect(queryByText("iconless")).not.toBeInTheDocument();
+    expect(queryByText(/more/)).not.toBeInTheDocument();
+    expect(container.querySelector("svg.lucide-clock")).toBeInTheDocument();
+    expect(
+      Array.from(
+        container.querySelector(".aui-working-step-chips")!.children,
+        (chip) => chip.textContent,
+      ),
+    ).toEqual([
+      "Arc",
+      "1 tx",
+      "Pending confirmation",
+      "extra",
+      "Hoodit",
+      "Portfolio",
+    ]);
+  });
+
+  it("animates only badges that arrive on an existing live row", () => {
+    const base = {
+      icon: "tool" as const,
+      title: "Commit transactions",
+      confidence: "high" as const,
+      rawLabel: "evm_commit_txs",
+      failed: false,
+    };
+    const { getByText, rerender } = render(
+      <ToolStepRow
+        interpretation={{
+          ...base,
+          chips: [{ label: "Pending", icon: "pending" }],
+        }}
+        done={false}
+        active
+        animate={false}
+        animateUpdates
+      />,
+    );
+
+    expect(getByText("Pending").parentElement).not.toHaveClass("animate-in");
+
+    rerender(
+      <ToolStepRow
+        interpretation={{
+          ...base,
+          chips: [
+            { label: "Base", icon: "block" },
+            { label: "Pending", icon: "pending" },
+          ],
+        }}
+        done
+        active={false}
+        animate={false}
+        animateUpdates
+      />,
+    );
+
+    expect(getByText("Base").parentElement).toHaveClass("animate-in");
+    expect(getByText("Pending").parentElement).not.toHaveClass("animate-in");
+
+    rerender(
+      <ToolStepRow
+        interpretation={{
+          ...base,
+          chips: [
+            { label: "Base", icon: "block" },
+            { label: "Success", icon: "success" },
+          ],
+        }}
+        done
+        active={false}
+        animate={false}
+        animateUpdates
+      />,
+    );
+
+    expect(getByText("Base").parentElement).not.toHaveClass("animate-in");
+    expect(getByText("Success").parentElement).toHaveClass("animate-in");
+
+    rerender(
+      <ToolStepRow
+        interpretation={{
+          ...base,
+          chips: [
+            { label: "Base", icon: "block" },
+            { label: "Success", icon: "success" },
+          ],
+        }}
+        done
+        active={false}
+        animate={false}
+        animateUpdates
+      />,
+    );
+
+    expect(getByText("Base").parentElement).not.toHaveClass("animate-in");
+    expect(getByText("Success").parentElement).not.toHaveClass("animate-in");
+
+    rerender(
+      <ToolStepRow
+        interpretation={{
+          ...base,
+          chips: [
+            { label: "Base", icon: "block" },
+            { label: "21,000 gas", icon: "gas" },
+            { label: "Success", icon: "success" },
+          ],
+        }}
+        done
+        active={false}
+        animate={false}
+      />,
+    );
+
+    expect(getByText("21,000 gas").parentElement).not.toHaveClass("animate-in");
+  });
+
+  it("uses a compact status pill before trace steps arrive", () => {
+    const { container, getByRole } = render(<MinimalWorkingTrace />);
+
+    expect(getByRole("status", { name: "Aomi is thinking" })).toHaveTextContent(
+      "Thinking",
+    );
+    expect(container.querySelector(".aui-working-trace-start")).toHaveClass(
+      "h-8",
+      "w-fit",
+      "rounded-full",
+      "pl-3",
+      "pr-4",
+      "border-aomi-border",
+      "bg-aomi-surface",
+    );
+    expect(container.querySelector(".aui-working-trace-start")).not.toHaveClass(
+      "h-9",
+      "px-3",
+      "-mt-px",
+    );
+    expect(container.querySelector(".aui-working-shimmer")).toHaveClass(
+      "text-[13px]",
+      "font-medium",
+      "leading-none",
+    );
+    expect(container.querySelector(".aui-working-shimmer")).not.toHaveClass(
+      "-top-px",
+    );
+    expect(container.querySelector(".aui-thinking-glyph")).toBeTruthy();
+    expect(container.querySelector(".aui-thinking-bulb")).toBeTruthy();
+    expect(container.querySelector(".aui-working-glyph")).toBeNull();
+    expect(container.querySelector(".aui-working-trace")).toBeNull();
+    expect(getByRole("status")).toHaveTextContent(/^Thinking$/);
+  });
+
+  it("keeps Thinking and collapsed Worked chips the same size", () => {
+    const { getByRole } = render(
+      <>
+        <MinimalWorkingTrace />
+        <WorkingTrace running={false} items={[]} revealed={0} />
+      </>,
+    );
+
+    const thinking = getByRole("status", { name: "Aomi is thinking" });
+    const worked = getByRole("button", { name: /Worked it out/ });
+    for (const className of [
+      "h-8",
+      "w-fit",
+      "rounded-full",
+      "pl-3",
+      "pr-4",
+      "border-aomi-border",
+      "bg-aomi-surface",
+    ]) {
+      expect(thinking).toHaveClass(className);
+      expect(worked).toHaveClass(className);
+    }
+  });
+
+  it("shows completed duration as whole seconds", () => {
+    const now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const { getByRole, rerender } = render(
+        <WorkingTrace
+          running
+          items={[]}
+          revealed={0}
+          startedAtMs={now - 6400}
+        />,
+      );
+
+      rerender(
+        <WorkingTrace
+          running={false}
+          items={[]}
+          revealed={0}
+          startedAtMs={now - 6400}
+        />,
+      );
+
+      expect(getByRole("button", { name: /Worked for/ })).toHaveTextContent(
+        "Worked for 6s",
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("reports a delegated span when it mounts after the run finished", () => {
+    // A delegating turn's `task` part lands only once its children are done, so
+    // this trace never sees running -> complete. It must still report the work.
+    const now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const finished: TaskRunState = {
+        ...run([]),
+        status: "completed",
+        startedAt: now - 9000,
+        durationMs: 8600,
+      };
+      const { getByRole } = render(
+        <WorkingTrace
+          running={false}
+          items={buildTraceItems([], [finished])}
+          revealed={1}
+          startedAtMs={finished.startedAt}
+        />,
+      );
+
+      expect(getByRole("button", { name: /Worked for/ })).toHaveTextContent(
+        "Worked for 9s",
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("renders received text immediately without synthetic typing", () => {
+    const { getByTestId, rerender } = render(
+      <RenderedText text="First text" />,
+    );
+    expect(getByTestId("rendered-text")).toHaveTextContent("First text");
+    rerender(<RenderedText text="First text, now extended" />);
+    expect(getByTestId("rendered-text")).toHaveTextContent(
+      "First text, now extended",
+    );
+  });
+
+  it("uses Working without exposing the internal execution mode", () => {
+    const { container, getByText } = render(
+      <WorkingTrace running items={[]} revealed={0} />,
+    );
+
+    expect(container).toHaveTextContent("Working");
+    expect(getByText("Working")).toHaveClass(
+      "text-[13px]",
+      "font-medium",
+      "leading-none",
+      "aui-working-shimmer",
+    );
+    expect(container).not.toHaveTextContent(/orchestrat/i);
+    expect(container.querySelector(".aui-working-glyph")).toBeTruthy();
+    expect(container.querySelector(".aui-working-cog")).toBeTruthy();
+    expect(container.querySelector(".aui-thinking-glyph")).toBeNull();
+    expect(container).not.toHaveTextContent("0 steps");
+  });
+
+  it("keeps the trace body mounted while animating it open and closed", () => {
+    const { container, getByRole } = render(
+      <WorkingTrace running items={[]} revealed={0} />,
+    );
+    const toggle = getByRole("button", { name: /Working/ });
+    const body = container.querySelector<HTMLElement>(
+      ".aui-working-trace > div",
+    )!;
+
+    expect(body).toHaveClass("grid-rows-[1fr]", "opacity-100");
+    expect(body).not.toHaveClass("hidden");
+
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(body).toHaveClass("grid-rows-[0fr]", "opacity-0");
+    expect(body).not.toHaveClass("hidden");
+    expect(body).toHaveAttribute("aria-hidden", "true");
+
+    fireEvent.click(toggle);
+
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(body).toHaveClass("grid-rows-[1fr]", "opacity-100");
+  });
+
+  it("stays open until final-answer playback is ready", () => {
+    vi.useFakeTimers();
+    try {
+      const { getByRole, rerender } = render(
+        <WorkingTrace running items={[]} revealed={0} collapseReady={false} />,
+      );
+
+      rerender(
+        <WorkingTrace
+          running={false}
+          items={[]}
+          revealed={0}
+          collapseReady={false}
+        />,
+      );
+      act(() => vi.advanceTimersByTime(1_000));
+      expect(getByRole("button", { name: /Worked/ })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+
+      rerender(
+        <WorkingTrace running={false} items={[]} revealed={0} collapseReady />,
+      );
+      act(() => vi.advanceTimersByTime(500));
+      expect(getByRole("button", { name: /Worked/ })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the reader's reopened completed trace expanded after a chat revisit", () => {
+    vi.useFakeTimers();
+    try {
+      const store = createChatViewStore();
+      const context = { threadId: "chat-a", store };
+      const completedTrace = (
+        <ChatViewContext.Provider value={context}>
+          <WorkingTrace running={false} items={[]} revealed={0} collapseReady />
+        </ChatViewContext.Provider>
+      );
+      const first = render(completedTrace);
+      fireEvent.click(first.getByRole("button", { name: /Worked/ }));
+      expect(first.getByRole("button", { name: /Worked/ })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+      first.unmount();
+      const revisited = render(completedTrace);
+      act(() => vi.advanceTimersByTime(1_000));
+      expect(revisited.getByRole("button", { name: /Worked/ })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("follows nested subagent steps while the trace is pinned to latest", () => {
+    const item = (state: TaskRunState) => ({
+      kind: "agent" as const,
+      agentId: state.agentId,
+      run: state,
+      order: 0,
+      key: state.agentId,
+    });
+    const initialRun = run([]);
+    const { container, rerender } = render(
+      <WorkingTrace running items={[item(initialRun)]} revealed={1} />,
+    );
+    const viewport = container.querySelector<HTMLElement>(
+      ".aui-working-trace-viewport",
+    )!;
+    const body = container.querySelector<HTMLElement>(
+      ".aui-working-trace-body",
+    )!;
+    const setScrollTop = vi.fn();
+    Object.defineProperties(viewport, {
+      scrollHeight: { configurable: true, get: () => 640 },
+      scrollTop: { configurable: true, get: () => 0, set: setScrollTop },
+    });
+    Object.defineProperty(body, "offsetHeight", {
+      configurable: true,
+      get: () => 640,
+    });
+
+    const updatedRun = run([
+      {
+        kind: "tool_call",
+        toolName: "get_chain_context",
+        args: null,
+        resultPreview: "",
+        childSeq: 1,
+      },
+    ]);
+    rerender(<WorkingTrace running items={[item(updatedRun)]} revealed={1} />);
+    publishBodyLayout(body, 640);
+
+    expect(setScrollTop).toHaveBeenCalledWith(640);
+    expect(viewport).toHaveAttribute("tabindex", "0");
+    expect(container).toHaveTextContent("Show all 2 steps");
+  });
+
+  it("keeps the live inner window at the latest child step", () => {
+    const item = (state: TaskRunState) => ({
+      kind: "agent" as const,
+      agentId: state.agentId,
+      run: state,
+      order: 0,
+      key: state.agentId,
+    });
+    const { container, rerender } = render(
+      <WorkingTrace running items={[item(run([]))]} revealed={1} />,
+    );
+    const viewport = container.querySelector<HTMLElement>(
+      ".aui-working-trace-viewport",
+    )!;
+    const body = container.querySelector<HTMLElement>(
+      ".aui-working-trace-body",
+    )!;
+    const setScrollTop = vi.fn();
+    let scrollTop = 80;
+    Object.defineProperties(viewport, {
+      scrollHeight: { configurable: true, get: () => 640 },
+      clientHeight: { configurable: true, get: () => 200 },
+      scrollTop: {
+        configurable: true,
+        get: () => scrollTop,
+        set: (value: number) => {
+          scrollTop = value;
+          setScrollTop(value);
+        },
+      },
+    });
+    fireEvent.scroll(viewport);
+    rerender(
+      <WorkingTrace
+        running
+        items={[
+          item(
+            run([
+              {
+                kind: "tool_call",
+                toolName: "get_chain_context",
+                args: null,
+                resultPreview: "",
+                childSeq: 1,
+              },
+            ]),
+          ),
+        ]}
+        revealed={1}
+      />,
+    );
+    publishBodyLayout(body, 640);
+    expect(setScrollTop).toHaveBeenCalledWith(640);
+    expect(viewport.scrollTop).toBe(640);
+    expect(container).toHaveTextContent("2 steps");
+    expect(container).toHaveTextContent("Get chain context");
+
+    rerender(
+      <WorkingTrace
+        running
+        items={[
+          item(
+            run([
+              {
+                kind: "tool_call",
+                toolName: "get_chain_context",
+                args: null,
+                resultPreview: "Chain context resolved",
+                childSeq: 1,
+              },
+            ]),
+          ),
+        ]}
+        revealed={1}
+      />,
+    );
+    publishBodyLayout(body, 640);
+    expect(setScrollTop).toHaveBeenCalledWith(640);
+    expect(viewport.scrollTop).toBe(640);
+  });
+
+  it("uses natural observed layout for overflow and following without forcing a height read on each update", () => {
+    const note = (text: string) => [
+      { kind: "note" as const, key: "note", text },
+      { kind: "note" as const, key: "next", text: "Next detail" },
+    ];
+    const view = render(<WorkingTrace running items={note("Working")} revealed={1} />);
+    const viewport = view.container.querySelector<HTMLElement>(".aui-working-trace-viewport")!;
+    const body = view.container.querySelector<HTMLElement>(".aui-working-trace-body")!;
+    const heightRead = vi.fn(() => 640);
+    const scrollHeightRead = vi.fn(() => 640);
+    const writes = vi.fn();
+    let top = 0;
+    Object.defineProperties(body, { offsetHeight: { configurable: true, get: heightRead } });
+    Object.defineProperties(viewport, {
+      scrollHeight: { configurable: true, get: scrollHeightRead },
+      clientHeight: { configurable: true, get: () => 260 },
+      scrollTop: { configurable: true, get: () => top, set: (value: number) => { top = value; writes(value); } },
+    });
+    view.rerender(<WorkingTrace running items={note("More live detail")} revealed={2} />);
+    expect(heightRead).not.toHaveBeenCalled();
+    expect(scrollHeightRead).not.toHaveBeenCalled();
+    publishBodyLayout(body, 640);
+    expect(heightRead).not.toHaveBeenCalled();
+    expect(writes).toHaveBeenLastCalledWith(640);
+    expect(viewport).toHaveAttribute("tabindex", "0");
+    expect(view.container).toHaveTextContent("Show all 2 steps");
+
+    view.rerender(<WorkingTrace running={false} items={note("Finished")} revealed={2} />);
+    top = 100;
+    fireEvent.scroll(viewport);
+    writes.mockClear();
+    publishBodyLayout(body, 700);
+    expect(writes).not.toHaveBeenCalled();
+    expect(viewport.scrollTop).toBe(100);
+    fireEvent.click(view.getByRole("button", { name: /Worked/ }));
+    fireEvent.click(view.getByRole("button", { name: /Worked/ }));
+    publishBodyLayout(body, 700);
+    expect(writes).toHaveBeenLastCalledWith(640);
+    expect(heightRead).not.toHaveBeenCalled();
+
+    vi.stubGlobal("matchMedia", () => ({ matches: true }));
+    fireEvent.click(view.getByRole("button", { name: "Show all 2 steps" }));
+    expect(viewport.style.maxHeight).toBe("");
+    writes.mockClear();
+    publishBodyLayout(body, 800);
+    expect(writes).not.toHaveBeenCalled();
+    fireEvent.click(view.getByRole("button", { name: "Collapse to recent steps" }));
+    publishBodyLayout(body, 800);
+    expect(viewport.style.maxHeight).toBe("260px");
+    expect(writes).toHaveBeenLastCalledWith(640);
+    expect(heightRead).not.toHaveBeenCalled();
+  });
+
+  it("leaves a trace within the overflow tolerance uncapped", () => {
+    // The 1-wei staging run settles 9px taller than the window: a cap there
+    // has no Show all or fades, yet scrolls the first row into the divider.
+    const items = [
+      { kind: "note" as const, key: "a", text: "Prepared the transfer" },
+      { kind: "note" as const, key: "b", text: "Waiting for approval" },
+    ];
+    const view = render(
+      <WorkingTrace running={false} items={items} revealed={2} />,
+    );
+    const viewport = view.container.querySelector<HTMLElement>(
+      ".aui-working-trace-viewport",
+    )!;
+    const body = view.container.querySelector<HTMLElement>(
+      ".aui-working-trace-body",
+    )!;
+    fireEvent.click(view.getByRole("button", { name: /Worked/ }));
+
+    publishBodyLayout(body, 269);
+    expect(viewport.style.maxHeight).toBe("");
+    expect(view.container).not.toHaveTextContent("Show all");
+
+    publishBodyLayout(body, 300);
+    expect(viewport.style.maxHeight).toBe("260px");
+    expect(view.container).toHaveTextContent("Show all 2 steps");
+  });
+
+  it("pins the window to its newest step once the cap lands", () => {
+    // The final note can be the last growth after the run finished: the
+    // follow must scroll the capped window, not the uncapped one before it.
+    const items = [
+      { kind: "note" as const, key: "a", text: "Prepared the transfer" },
+      { kind: "note" as const, key: "b", text: "Waiting for approval" },
+    ];
+    const view = render(
+      <WorkingTrace running={false} items={items} revealed={2} />,
+    );
+    const viewport = view.container.querySelector<HTMLElement>(
+      ".aui-working-trace-viewport",
+    )!;
+    const body = view.container.querySelector<HTMLElement>(
+      ".aui-working-trace-body",
+    )!;
+    fireEvent.click(view.getByRole("button", { name: /Worked/ }));
+    const cappedScrolls: string[] = [];
+    Object.defineProperties(viewport, {
+      scrollHeight: { configurable: true, get: () => 300 },
+      scrollTop: {
+        configurable: true,
+        get: () => 0,
+        set: () => cappedScrolls.push(viewport.style.maxHeight),
+      },
+    });
+
+    publishBodyLayout(body, 300);
+
+    expect(viewport.style.maxHeight).toBe("260px");
+    expect(cappedScrolls).toContain("260px");
+  });
+
+  it("names each batched child from its own work order", () => {
+    // History carries the mother's `{tasks: […]}` batch and the per-child
+    // results, but no live sidecar. Each row still belongs to one work order,
+    // so it must show that order's label instead of the bare placeholder.
+    const delegatedTask = {
+      type: "tool-call" as const,
+      argsText: "{}",
+      toolCallId: "call-batch",
+      toolName: "task",
+      args: {
+        tasks: [
+          { label: "Ethereum latest block", prompt: "one" },
+          { label: "Base latest block", prompt: "two" },
+        ],
+      },
+      result: {
+        status: "completed",
+        results: [
+          { agent_id: "task-agent:first", status: "completed" },
+          { agent_id: "task-agent:second", status: "completed" },
+        ],
+      },
+    } satisfies ToolCallMessagePart;
+
+    const { getByText, queryByText } = render(
+      <WorkingTrace
+        running={false}
+        items={buildTraceItems([delegatedTask], [])}
+        revealed={2}
+      />,
+    );
+
+    expect(getByText("Ethereum latest block")).toBeInTheDocument();
+    expect(getByText("Base latest block")).toBeInTheDocument();
+    expect(queryByText("agent")).toBeNull();
+  });
+});
+
+it("keeps ownership badges visible in the mother and delegated trace", () => {
+  const attribution = {
+    skills: [
+      { id: "lifi_swap", name: "lifi_swap", injectedTools: ["lifi_get_quote"] },
+    ],
+  };
+  const child = run([
+    {
+      kind: "tool_call",
+      toolName: "lifi_get_quote",
+      args: {},
+      resultPreview: JSON.stringify({ error: "Unavailable" }),
+      childSeq: 1,
+    },
+  ]);
+  const tool: ToolCallMessagePart = {
+    type: "tool-call",
+    toolCallId: "quote",
+    toolName: "lifi_get_quote",
+    args: {},
+    argsText: "{}",
+    result: { error: "Unavailable" },
+  };
+  const { getAllByText } = render(
+    <TraceAttributionContext.Provider value={attribution}>
+      <WorkingTrace
+        running
+        items={buildTraceItems([tool], [child])}
+        revealed={2}
+      />
+    </TraceAttributionContext.Provider>,
+  );
+  expect(getAllByText("LI.FI")).toHaveLength(2);
+});
+
+describe("context steps", () => {
+  const compacted = {
+    type: "tool-call" as const,
+    argsText: "{}",
+    toolCallId: "context:event-9",
+    toolName: "aomi:context",
+    args: {
+      kind: "compacted",
+      published: true,
+      tokensBefore: 151_000,
+      tokensAfter: 38_000,
+      durationMs: 2_400,
+    },
+    result: {},
+  } satisfies ToolCallMessagePart;
+  const trimmed = {
+    ...compacted,
+    toolCallId: "context:event-8",
+    args: {
+      kind: "trimmed",
+      tool: "evm_commit_txs",
+      id: "t_cc98",
+      bytes: 70_551,
+      tokens: 47,
+    },
+  } satisfies ToolCallMessagePart;
+
+  it("show a summary in progress, then its result in the same row", () => {
+    const compacting = {
+      ...compacted,
+      args: { kind: "compacting", tokensBefore: 151_000 },
+    } satisfies ToolCallMessagePart;
+    const { getByText } = render(
+      <WorkingTrace
+        running
+        items={buildTraceItems([compacting], [])}
+        revealed={1}
+      />,
+    );
+    expect(getByText("Summarizing earlier conversation")).toBeTruthy();
+    expect(getByText("151k tokens")).toBeTruthy();
+  });
+
+  it("read as plain steps with their sizes", () => {
+    const { getByText, queryByText } = render(
+      <WorkingTrace
+        running={false}
+        outcome="complete"
+        items={buildTraceItems([trimmed, compacted], [])}
+        revealed={1}
+      />,
+    );
+    expect(queryByText("Trimmed evm_commit_txs output")).toBeNull();
+    expect(getByText("Summarized earlier conversation")).toBeTruthy();
+    expect(getByText("151k to 38k tokens")).toBeTruthy();
+  });
+});
+
+describe("reading a shortened output", () => {
+  const trimmed = {
+    type: "tool-call" as const,
+    argsText: "{}",
+    toolCallId: "context:event-8",
+    toolName: "aomi:context",
+    args: {
+      kind: "trimmed",
+      tool: "evm_commit_txs",
+      id: "t_cc98",
+      bytes: 70,
+      tokens: 4,
+    },
+    result: {},
+  } satisfies ToolCallMessagePart;
+  const output = JSON.stringify({ commits: [{ id: "c1" }], ok: true });
+  const read = (n: number, offset: number, limit: number) => {
+    const slice = output.slice(offset, offset + limit);
+    const next = offset + slice.length;
+    return {
+      type: "tool-call" as const,
+      toolCallId: `read-${n}`,
+      toolName: "read_tool_output",
+      args: { id: "t_cc98", offset, limit },
+      argsText: JSON.stringify({ id: "t_cc98", offset, limit }),
+      result: {
+        id: "t_cc98",
+        total_chars: output.length,
+        offset,
+        slice,
+        next_offset: next < output.length ? next : null,
+        eof: next >= output.length,
+      },
+    } satisfies ToolCallMessagePart;
+  };
+  const reads = [read(1, 0, 15), read(2, 15, 15), read(3, 30, 15)];
+
+  it("fold consecutive pages into one row named after the source tool", () => {
+    const items = buildTraceItems([trimmed, ...reads], []);
+    expect(items.map((item) => item.kind)).toEqual(["read"]);
+    const { getByText } = render(
+      <WorkingTrace
+        running={false}
+        outcome="complete"
+        items={items}
+        revealed={1}
+      />,
+    );
+    expect(getByText("Read commit transactions output")).toBeTruthy();
+    expect(getByText(`All ${output.length} chars`)).toBeTruthy();
+    expect(getByText("3 reads")).toBeTruthy();
+  });
+
+  it("report a partial read and an expired output", () => {
+    const expired = {
+      ...read(4, 0, 20),
+      toolCallId: "read-x",
+      args: { id: "t_gone" },
+      argsText: '{"id":"t_gone"}',
+      result: { error: "expired", id: "t_gone" },
+    } satisfies ToolCallMessagePart;
+    const { getByText } = render(
+      <WorkingTrace
+        running={false}
+        outcome="complete"
+        items={buildTraceItems([trimmed, reads[0], expired], [])}
+        revealed={2}
+      />,
+    );
+    expect(getByText("43% of 35 chars")).toBeTruthy();
+    expect(getByText("Read saved tool output")).toBeTruthy();
+    expect(getByText("Output expired")).toBeTruthy();
+  });
+});

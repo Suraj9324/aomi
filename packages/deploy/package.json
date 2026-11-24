@@ -1,0 +1,76 @@
+{
+  "name": "@aomi-labs/deploy",
+  "version": "1.0.0",
+  "description": "TypeScript toolkit for the Aomi platform deploy API: response schemas, wire types, errors, activation helpers and the browser launch client. The manager client lives in the workspace package @aomi-labs/internal.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aomi-labs/aomi.git",
+    "directory": "packages/deploy"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./lifecycle": {
+      "import": {
+        "types": "./dist/lifecycle.d.ts",
+        "default": "./dist/lifecycle.js"
+      },
+      "require": {
+        "types": "./dist/lifecycle.d.cts",
+        "default": "./dist/lifecycle.cjs"
+      }
+    },
+    "./schemas": {
+      "import": {
+        "types": "./dist/schemas/index.d.ts",
+        "default": "./dist/schemas/index.js"
+      },
+      "require": {
+        "types": "./dist/schemas/index.d.cts",
+        "default": "./dist/schemas/index.cjs"
+      }
+    },
+    "./launch": {
+      "import": {
+        "types": "./dist/launch/index.d.ts",
+        "default": "./dist/launch/index.js"
+      },
+      "require": {
+        "types": "./dist/launch/index.d.cts",
+        "default": "./dist/launch/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "skills"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "clean:dist": "rm -rf dist"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "jose": "^5.9.6",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "fast-check": "^4.8.0"
+  }
+}

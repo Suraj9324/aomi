@@ -1,0 +1,97 @@
+---
+title: Working Trace Presentation Contract
+owner: frontend
+status: authoritative
+area: apps
+review_after_days: 30
+sources_of_truth:
+  - packages/client/src/trace/pipeline.ts
+  - packages/client/src/trace/protocols/protocol-matchers.ts
+  - packages/client/src/trace/identity.ts
+  - packages/client/src/trace/present/descriptors.ts
+  - packages/widget/src/thread/trace-icons.ts
+  - packages/widget/src/thread/working-trace-rows.tsx
+  - packages/widget/src/thread/working-trace-contract.test.tsx
+---
+
+# Working Trace Presentation Contract
+
+The shared widget presents tool calls in one chronological trace. Tool identity
+selects an interpreter. The interpreter reads execution facts from the tool's
+own arguments and result; the presenter owns the visible title, icon, chip order,
+and state marker. Portal and embedded widgets consume the same implementation.
+
+## Transaction lifecycle
+
+EVM and Solana stage, simulate, and commit rows share the slot order:
+
+1. Execution network, when the operation reports one.
+2. Count or progress, using the correct unit (`tx`, `instruction`, or confirmed fraction).
+3. One optional action or resource metric.
+4. Current state.
+
+The network, count, and state survive chip overflow. Missing facts leave their
+slot empty. A simulation's internal steps are not transaction count. EVM
+simulation uses `resolved_ids` (or the requested transaction ids before a
+result); Solana instruction staging counts `ix_ids`, while simulation and
+commit of an assembled instruction bundle count one transaction. Gas and
+compute units are separate metrics.
+
+`Staged`, `Passed`, `Awaiting approval`, `Awaiting signature`, `Submitted`,
+`Confirmed`, `Incomplete`, and failure/cancellation states describe distinct
+moments. A completed tool call may still have a waiting transaction; its row
+marker remains pending. Commit rows use the returned Commit Service views for
+state, network, transaction count, and partial confirmation progress.
+
+![Shared trace with staged approval and supply on Base](../assets/working-trace-light.png)
+
+The pictured commit is still running; it has a transaction count but no
+completed-state marker.
+
+Facts without a meaningful icon do not produce chips. Account details use the account tool's own
+network, address, and native balance/currency, including Arc's native USDC;
+they never inherit a previous tool's network.
+
+![Arc account and Aave trace without decorative dots](../assets/working-trace-arc-light.png)
+
+## Names and protocol context
+
+Declared core tool names resolve to stable action titles while active, after
+success, and after errors. For example, `evm_stage_tx`, `svm_stage_ix`, and the
+legacy `Evm stage` label show **Stage transaction**. Simulation, commit, web
+search, skill activation, contract details, and contract calls follow the same
+rule. Supported ERC-20 calls retain precise action titles such as **Read token
+decimals**.
+
+Protocol preparation has an explicit tool registration and result validation.
+Aave preparation shows its operation, amount, network, approval requirement,
+and prepared state; market and standalone token labels do not displace the
+amount. LI.FI swap preparation keeps source and destination token and amount
+details. A protocol payload never changes the structure or title of a core
+transaction lifecycle row. Tool ownership attribution is independent of
+presentation and must come from exact catalog declarations. Matching a
+registered presentation also requires the full declared tool name; a
+namespaced skill tool cannot borrow a core tool's presentation by suffix.
+
+Unknown tools, including tools injected by a skill, show a readable tool title
+and expandable details without inferred chain, token, amount, protocol, or
+action chips. Real errors still show a failed state. Adding rich presentation
+requires registering the tool identity and validating its result shape.
+
+## Interpreter layout
+
+`families/evm`, `families/svm`, and `families/general` own the corresponding
+core tools. `protocols` holds one adapter per integration, with its exact tool
+names, result validation, and semantic facts. `pipeline.ts` only asks the core
+and protocol registries for a matcher; it contains no protocol rules. To add a
+protocol such as Curve, add `protocols/curve.ts` and register its adapter in
+`protocols/protocol-matchers.ts`. A protocol adapter must return neutral
+fallback when its result is invalid.
+
+## Verification
+
+`working-trace-contract.test.tsx` covers names, unknown tools, EVM and Solana
+count units, incomplete simulations, commit progress, pending row markers,
+and overflow. `packages/client/src/trace/decode.test.ts` covers supported tool
+payloads.
+`tests/e2e/journeys/tx-review-sign.spec.ts` verifies review, rejection and replay on the Portal and embedded widget using the shared agent ledger. Real wallet authorization and signing remain in `visual-signing-contracts.spec.ts`. The image above is a historical illustration.

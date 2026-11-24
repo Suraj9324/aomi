@@ -1,0 +1,56 @@
+import type { EdgeEnv } from "../env";
+import { config, type Config } from "../kernel/config";
+import { getPool } from "@aomi-labs/account";
+
+import { EdgeError } from "../kernel/errors";
+import type { FetchLike } from "../kernel/proxy";
+import { postgresKeys, type ApiKeyStore } from "./api-keys";
+
+/** Everything the Build surface needs per request, resolved once. */
+export type BuildContext = {
+  env: EdgeEnv;
+  config: Config["build"];
+  /** The public Build origin this request arrived on (its own host). */
+  buildOrigin: string;
+  /** Where the Vercel Build app is reached from the edge (never the public host). */
+  upstreamOrigin: string | null;
+  /** Origins whose cookie writes Build trusts: its own origin only. */
+  trustedOrigins: readonly string[];
+  /** Cookies are Secure everywhere except local development. */
+  secureCookies: boolean;
+  fetchImpl: FetchLike;
+  now: () => number;
+  /** Builder API keys, in the database behind `HYPERDRIVE`. */
+  keys: ApiKeyStore;
+};
+
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+export function isBuildHost(env: EdgeEnv, host: string): boolean {
+  return config(env).build.hosts.has(host.toLowerCase());
+}
+
+export function buildContext(
+  request: Request,
+  env: EdgeEnv,
+  fetchImpl: FetchLike,
+  now: () => number = Date.now,
+): BuildContext | null {
+  const url = new URL(request.url);
+  const { build } = config(env);
+  if (!build.hosts.has(url.host.toLowerCase()) || (!build.upstream && !env.BUILD_PAGES)) return null;
+  return {
+    env,
+    config: build,
+    buildOrigin: url.origin,
+    upstreamOrigin: build.upstream,
+    trustedOrigins: [url.origin],
+    secureCookies: !LOCAL_HOSTS.has(url.hostname),
+    fetchImpl,
+    now,
+    keys: postgresKeys(() => {
+      if (!env.HYPERDRIVE) throw new EdgeError(503, "api_keys_unconfigured");
+      return getPool();
+    }),
+  };
+}

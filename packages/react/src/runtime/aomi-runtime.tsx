@@ -1,0 +1,271 @@
+"use client";
+
+import { useMemo, useRef } from "react";
+import type { ReactNode } from "react";
+
+import {
+  Aomi,
+  type ActionCapabilities,
+  type CommitCapabilities,
+  type AgentTarget,
+  type AomiClientOptions,
+  type AomiPlatformFilter,
+} from "@aomi-labs/client";
+import { ControlContextProvider } from "../contexts/control-context";
+import { NotificationContextProvider } from "../contexts/notification-context";
+import {
+  ThreadContextProvider,
+  useThreadContext,
+} from "../contexts/thread-context";
+import { ExtUserProvider } from "../contexts/ext-user-context";
+import {
+  DisplayCacheProvider,
+  type RuntimeAccount,
+} from "../query/display-cache";
+import type { DisplayPersistence } from "../query/display-persistence";
+import { AomiRuntimeCore } from "./core";
+import { useThreadNavigation } from "./use-thread-navigation";
+import {
+  buildThreadPersistenceKey,
+  readPersistedThreadId,
+} from "./thread-persistence";
+
+// =============================================================================
+// Props
+// =============================================================================
+
+export type AomiRuntimeProviderProps = {
+  children: ReactNode;
+  /**
+   * Who is signed in: a guest, a user, or nobody (null). Leave undefined while
+   * the host is still finding out; account data is neither shown nor restored
+   * until it is known.
+   */
+  account?: RuntimeAccount | null;
+  /** What to save across reloads. Defaults to the public catalogs. */
+  displayPersistence?: DisplayPersistence;
+  backendUrl?: string;
+  /** The `Aomi` to run on; otherwise one is made from `backendUrl` and `clientOptions`. */
+  aomi?: Aomi;
+  /** Credentials stay in memory unless a host opts into tab-scoped persistence. */
+  apiKeyPersistence?: "memory" | "session";
+  applicationId?: number | string | null;
+  /** Optional host-fixed target. Omit to use the per-thread Auto/Direct control. */
+  agentTarget?: AgentTarget;
+  appPlatforms?: AomiPlatformFilter;
+  clientOptions?: Omit<AomiClientOptions, "baseUrl">;
+  actions?: ActionCapabilities;
+  commits?: CommitCapabilities;
+  /** Whether an account session can load chats without a wallet. */
+  accountSessionAvailable?: boolean;
+  /** Optional explicit initial thread. Takes precedence over stored state. */
+  initialThreadId?: string;
+  /** Host-controlled selection; prop changes restore a thread without echoing callbacks. */
+  threadId?: string;
+  /** Reports selections made inside the runtime. */
+  onThreadChange?: (threadId: string) => void;
+  /** Persist the active materialized thread in localStorage. Defaults to true. */
+  persistThread?: boolean;
+  /** Full localStorage key override for vendors that need exact isolation. */
+  threadPersistenceKey?: string;
+  /** Extra key segment for tenant/user/app scoping of the stored thread. */
+  threadPersistenceScope?: string | null;
+};
+
+// =============================================================================
+// Provider Shell
+// =============================================================================
+
+export function AomiRuntimeProvider({
+  children,
+  account,
+  displayPersistence,
+  backendUrl,
+  aomi: suppliedAomi,
+  apiKeyPersistence,
+  applicationId,
+  agentTarget,
+  appPlatforms,
+  clientOptions,
+  actions,
+  commits,
+  accountSessionAvailable = false,
+  initialThreadId,
+  threadId,
+  onThreadChange,
+  persistThread = true,
+  threadPersistenceKey,
+  threadPersistenceScope,
+}: Readonly<AomiRuntimeProviderProps>) {
+  if (backendUrl === undefined)
+    throw new Error(
+      "[aomi] backendUrl is required; pass your API URL explicitly (an empty string selects same-origin transport).",
+    );
+  const resolvedThreadPersistenceKey = useMemo(() => {
+    if (!persistThread) return null;
+    return (
+      threadPersistenceKey ??
+      buildThreadPersistenceKey({
+        backendUrl,
+        applicationId,
+        scope: threadPersistenceScope,
+      })
+    );
+  }, [
+    applicationId,
+    backendUrl,
+    persistThread,
+    threadPersistenceKey,
+    threadPersistenceScope,
+  ]);
+
+  const restoredThreadId = useMemo(() => {
+    if (initialThreadId) return initialThreadId;
+    if (!resolvedThreadPersistenceKey) return undefined;
+    return readPersistedThreadId(resolvedThreadPersistenceKey) ?? undefined;
+  }, [initialThreadId, resolvedThreadPersistenceKey]);
+
+  const resolvedClientOptions = useMemo(
+    () => ({
+      logger: {
+        debug: (...args: unknown[]) => console.debug(...args),
+      },
+      ...clientOptions,
+    }),
+    [clientOptions],
+  );
+
+  const confirmedCookieSession = useRef(accountSessionAvailable);
+  confirmedCookieSession.current = accountSessionAvailable;
+  const aomi = useMemo(
+    () =>
+      suppliedAomi ??
+      new Aomi({
+        baseUrl: backendUrl,
+        ...resolvedClientOptions,
+        cookieSession: () => confirmedCookieSession.current,
+        // An account bearer alone is the session; it gets no guest beside it.
+        guest:
+          resolvedClientOptions.guest ??
+          (resolvedClientOptions.getAccountBearer ? false : undefined),
+      }),
+    [suppliedAomi, backendUrl, resolvedClientOptions],
+  );
+
+  return (
+    <DisplayCacheProvider
+      backendUrl={backendUrl}
+      applicationId={applicationId}
+      account={account}
+      persistence={displayPersistence}
+      aomi={aomi}
+    >
+      <ThreadContextProvider initialThreadId={threadId ?? restoredThreadId}>
+        <NotificationContextProvider>
+          <ExtUserProvider>
+            <AomiRuntimeInner
+              account={account}
+              threadId={threadId}
+              onThreadChange={onThreadChange}
+              aomi={aomi}
+              accountAuthSource={
+                resolvedClientOptions.getAccountBearer?.required
+                  ? resolvedClientOptions.getAccountBearer
+                  : resolvedClientOptions.oauth
+              }
+              apiKeyPersistence={apiKeyPersistence}
+              backendUrl={backendUrl}
+              applicationId={applicationId}
+              agentTarget={agentTarget}
+              appPlatforms={appPlatforms}
+              accountSessionAvailable={accountSessionAvailable}
+              actions={actions}
+              commits={commits}
+              restoredThreadId={restoredThreadId}
+              threadPersistenceKey={resolvedThreadPersistenceKey}
+            >
+              {children}
+            </AomiRuntimeInner>
+          </ExtUserProvider>
+        </NotificationContextProvider>
+      </ThreadContextProvider>
+    </DisplayCacheProvider>
+  );
+}
+
+// =============================================================================
+// Inner Provider (needs ThreadContext and UserContext)
+// =============================================================================
+
+type AomiRuntimeInnerProps = {
+  children: ReactNode;
+  account?: RuntimeAccount | null;
+  aomi: Aomi;
+  accountAuthSource?:
+    | AomiClientOptions["getAccountBearer"]
+    | AomiClientOptions["oauth"];
+  apiKeyPersistence?: "memory" | "session";
+  backendUrl: string;
+  applicationId?: number | string | null;
+  agentTarget?: AgentTarget;
+  appPlatforms?: AomiPlatformFilter;
+  accountSessionAvailable: boolean;
+  actions?: ActionCapabilities;
+  commits?: CommitCapabilities;
+  restoredThreadId?: string;
+  threadId?: string;
+  onThreadChange?: (threadId: string) => void;
+  threadPersistenceKey?: string | null;
+};
+
+function AomiRuntimeInner({
+  children,
+  account,
+  aomi,
+  accountAuthSource,
+  apiKeyPersistence,
+  backendUrl,
+  applicationId,
+  agentTarget,
+  appPlatforms,
+  accountSessionAvailable,
+  actions,
+  commits,
+  restoredThreadId,
+  threadId,
+  onThreadChange,
+  threadPersistenceKey,
+}: Readonly<AomiRuntimeInnerProps>) {
+  const threadContext = useThreadContext();
+  const initialSelection = useRef(threadId ?? restoredThreadId).current;
+  useThreadNavigation(threadId, onThreadChange);
+
+  return (
+    <ControlContextProvider
+      aomi={aomi}
+      backendUrl={backendUrl}
+      apiKeyPersistence={apiKeyPersistence}
+      sessionId={threadContext.currentThreadId}
+      getThreadMetadata={threadContext.getThreadMetadata}
+      updateThreadMetadata={threadContext.updateThreadMetadata}
+      appPlatforms={appPlatforms}
+      applicationId={applicationId}
+      accountSessionAvailable={accountSessionAvailable}
+      account={account}
+    >
+      <AomiRuntimeCore
+        account={account}
+        aomiClient={aomi.raw}
+        accountAuthSource={accountAuthSource}
+        agentTarget={agentTarget}
+        accountSessionAvailable={accountSessionAvailable}
+        actions={actions}
+        commits={commits}
+        restoredThreadId={initialSelection}
+        threadPersistenceKey={threadPersistenceKey}
+      >
+        {children}
+      </AomiRuntimeCore>
+    </ControlContextProvider>
+  );
+}

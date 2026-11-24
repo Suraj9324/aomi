@@ -1,0 +1,47 @@
+{
+  "compilerOptions": {
+    "target": "ES2017",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": false,
+    "declaration": true,
+    "declarationMap": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "paths": {
+      "@/*": [
+        "./packages/react/src/*"
+      ],
+      "@aomi-labs/client": [
+        "./packages/client/src/index.ts"
+      ],
+      "@aomi-labs/client/trace": [
+        "./packages/client/src/trace/index.ts"
+      ]
+    },
+    "baseUrl": "."
+  },
+  "include": [
+    "packages/react/src/**/*.ts",
+    "packages/react/src/**/*.tsx"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "example",
+    "app",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/__tests__/**"
+  ]
+}

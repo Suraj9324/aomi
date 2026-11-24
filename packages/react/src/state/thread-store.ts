@@ -1,0 +1,242 @@
+import type { SetStateAction } from "react";
+import { safeEnv, type AgentMode, type ThreadOrigin } from "@aomi-labs/client";
+
+import type { ThreadContext } from "../contexts/thread-context";
+import { generateUUID } from "../utils/client-session";
+import { DEFAULT_THREAD_TITLE } from "../runtime/thread-title";
+
+const threadLogEnv = safeEnv(() => process.env.NODE_ENV);
+const shouldLogThreadUpdates =
+  threadLogEnv !== undefined && threadLogEnv !== "production";
+
+export type ThreadStatus = "regular" | "archived";
+export type ModelSelectionMode = "auto" | "manual";
+
+export type ThreadControlState = {
+  /** Missing on persisted threads created before Auto became the default. */
+  agentMode?: AgentMode;
+  model: string | null;
+  modelMode?: ModelSelectionMode;
+  app: string | null;
+  applicationId: number | string | null;
+  controlDirty: boolean;
+};
+
+export type ThreadMetadata = {
+  title: string;
+  status: ThreadStatus;
+  lastActiveAt?: string | number;
+  control: ThreadControlState;
+  /** Local first submission, before the server acknowledges the conversation. */
+  pending?: boolean;
+  /** Where the thread was started, when the server reports it. Badge only. */
+  origin?: ThreadOrigin;
+  /**
+   * Refs waiting for the user's approval on this thread and its scheduled
+   * runs, oldest first, when the server reports any.
+   */
+  awaitingApproval?: string[];
+};
+
+export function initThreadControl(): ThreadControlState {
+  return {
+    model: null,
+    modelMode: "auto",
+    app: null,
+    applicationId: null,
+    controlDirty: false,
+  };
+}
+
+type ThreadStoreState = {
+  currentThreadId: string;
+  threadViewKey: number;
+  threadCnt: number;
+  threadMetadata: Map<string, ThreadMetadata>;
+};
+
+type ThreadStoreOptions = {
+  initialThreadId?: string;
+};
+
+// Untitled: the list shows "New Chat" for it without storing that label.
+const initialMetadata = (): ThreadMetadata => ({
+  title: "",
+  status: "regular",
+  lastActiveAt: new Date().toISOString(),
+  control: initThreadControl(),
+});
+
+const logThreadMetadataChange = (
+  source: string,
+  threadId: string,
+  previous: ThreadMetadata | undefined,
+  next: ThreadMetadata | undefined,
+) => {
+  if (!shouldLogThreadUpdates || (!previous && !next)) return;
+  if (
+    !previous ||
+    !next ||
+    previous.title !== next.title ||
+    previous.status !== next.status ||
+    previous.lastActiveAt !== next.lastActiveAt
+  ) {
+    console.debug(`[aomi][thread:${source}]`, {
+      threadId,
+      previous,
+      next,
+    });
+  }
+};
+
+export class ThreadStore {
+  /**
+   * Titles read as plain text. Old server titles may contain a flattened,
+   * truncated model-only envelope, and a title taken from the first message
+   * keeps its @-mention markers ("✦ Aave", "◇ Base"); both go.
+   */
+  private static cleanTitle(title: string): string {
+    const start = title.indexOf("<AOMI_UI_CAPABILITY_HINTS>");
+    const text = (start < 0 ? title : title.slice(0, start).trimEnd())
+      .replace(/[✦▦◇◈]\s*/gu, "")
+      .trim();
+    // A title that was only the envelope keeps a visible label.
+    return text || (title ? DEFAULT_THREAD_TITLE : title);
+  }
+
+  private state: ThreadStoreState;
+  private readonly listeners = new Set<() => void>();
+  private snapshot: ThreadContext;
+
+  constructor(options?: ThreadStoreOptions) {
+    const currentThreadId = options?.initialThreadId ?? generateUUID();
+    this.state = {
+      currentThreadId,
+      threadViewKey: 0,
+      threadCnt: 1,
+      threadMetadata: new Map([[currentThreadId, initialMetadata()]]),
+    };
+    this.snapshot = this.buildSnapshot();
+  }
+
+  subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+
+  getSnapshot = (): ThreadContext => this.snapshot;
+
+  private buildSnapshot(): ThreadContext {
+    return {
+      currentThreadId: this.state.currentThreadId,
+      setCurrentThreadId: this.setCurrentThreadId,
+      threadViewKey: this.state.threadViewKey,
+      bumpThreadViewKey: this.bumpThreadViewKey,
+      allThreadsMetadata: this.state.threadMetadata,
+      setThreadMetadata: this.setThreadMetadata,
+      threadCnt: this.state.threadCnt,
+      setThreadCnt: this.setThreadCnt,
+      getThreadMetadata: this.getThreadMetadata,
+      updateThreadMetadata: this.updateThreadMetadata,
+      resetToDefault: this.resetToDefault,
+    };
+  }
+
+  private updateState(partial: Partial<ThreadStoreState>) {
+    this.state = { ...this.state, ...partial };
+    this.snapshot = this.buildSnapshot();
+    for (const listener of this.listeners) listener();
+  }
+
+  private ensureThreadExists(threadId: string) {
+    if (this.state.threadMetadata.has(threadId)) return;
+    const threadMetadata = new Map(this.state.threadMetadata);
+    threadMetadata.set(threadId, initialMetadata());
+    this.state = { ...this.state, threadMetadata };
+  }
+
+  setCurrentThreadId = (threadId: string) => {
+    this.ensureThreadExists(threadId);
+    this.updateState({ currentThreadId: threadId });
+  };
+
+  bumpThreadViewKey = () => {
+    this.updateState({ threadViewKey: this.state.threadViewKey + 1 });
+  };
+
+  setThreadCnt = (updater: SetStateAction<number>) => {
+    this.updateState({
+      threadCnt:
+        typeof updater === "function" ? updater(this.state.threadCnt) : updater,
+    });
+  };
+
+  setThreadMetadata = (
+    updater: SetStateAction<Map<string, ThreadMetadata>>,
+  ) => {
+    const previous = this.state.threadMetadata;
+    const resolved =
+      typeof updater === "function" ? updater(previous) : updater;
+    const threadMetadata = new Map(
+      [...resolved].map(([id, metadata]) => [
+        id,
+        { ...metadata, title: ThreadStore.cleanTitle(metadata.title) },
+      ]),
+    );
+    for (const [threadId, next] of threadMetadata) {
+      logThreadMetadataChange(
+        "setThreadMetadata",
+        threadId,
+        previous.get(threadId),
+        next,
+      );
+    }
+    for (const [threadId, value] of previous) {
+      if (!threadMetadata.has(threadId)) {
+        logThreadMetadataChange(
+          "setThreadMetadata",
+          threadId,
+          value,
+          undefined,
+        );
+      }
+    }
+    this.updateState({ threadMetadata });
+  };
+
+  getThreadMetadata = (threadId: string): ThreadMetadata | undefined =>
+    this.state.threadMetadata.get(threadId);
+
+  updateThreadMetadata = (
+    threadId: string,
+    updates: Partial<ThreadMetadata>,
+  ) => {
+    const previous = this.state.threadMetadata.get(threadId);
+    if (!previous) return;
+    const next = { ...previous, ...updates };
+    next.title = ThreadStore.cleanTitle(next.title);
+    if (
+      (Object.keys(next) as (keyof ThreadMetadata)[]).every(
+        (key) => next[key] === previous[key],
+      )
+    )
+      return;
+    const threadMetadata = new Map(this.state.threadMetadata);
+    threadMetadata.set(threadId, next);
+    logThreadMetadataChange("updateThreadMetadata", threadId, previous, next);
+    this.updateState({ threadMetadata });
+  };
+
+  resetToDefault = () => {
+    const currentThreadId = generateUUID();
+    this.state = {
+      currentThreadId,
+      threadViewKey: this.state.threadViewKey + 1,
+      threadCnt: 1,
+      threadMetadata: new Map([[currentThreadId, initialMetadata()]]),
+    };
+    this.snapshot = this.buildSnapshot();
+    for (const listener of this.listeners) listener();
+    return currentThreadId;
+  };
+}

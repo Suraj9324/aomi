@@ -1,0 +1,50 @@
+# Consumer compatibility acceptance
+
+`pnpm run test:contracts` packs the
+candidate client, React runtime, and widget packages. It installs their tarballs
+into the headless and widget examples copied from the trusted base commit, then
+compiles and builds those examples. The headless example's TypeScript source
+alias is removed in the temporary copy so it resolves the packed client.
+
+Consumer selection uses only manifests in the trusted commit, supporting both
+the historical `apps/examples/headless-client` and `apps/widget-consumer` paths
+and the relocated `examples/headless` and `examples/embed-vite` paths. If both
+layouts exist at the base, both are checked. Candidate-only fixtures have no
+historical compatibility contract; the fresh-install checks still run. An
+existing widget fixture must have its matching trusted lockfile importer.
+Browser contracts require a trusted widget fixture and never use candidate
+source as a fallback.
+
+The same command also creates a synthetic clean host with only the public widget
+and React declared directly. It installs the full candidate Aomi package stack,
+public runtime imports must load, and the packed `aomi --version` executable must
+run. Third-party peer-range warnings remain advisory and visible. This catches
+undeclared or workspace-hoisted dependencies that the immutable historical
+fixtures intentionally keep.
+
+The baseline isolation test creates a small Git repository, commits a consumer
+that imports `Aomi`, commits a candidate change to import `NewAomi`, and verifies
+the extracted test consumer still imports `Aomi` from the base commit. It also
+rejects a missing base consumer. Pin validation rejects missing or malformed
+configuration, and CLI overrides reject zero or unknown revisions before packaging. Run these with
+`node --test tests/contracts/*.test.mjs`.
+
+On 2026-09-13, the full check passed against base `cc556219`: headless TypeScript,
+11 headless tests, packed ESM/CommonJS imports, widget TypeScript, and Vite
+production build. For negative acceptance, the isolated installed client's
+`dist/index.d.ts` export of `Aomi` was temporarily removed. The unchanged
+trusted-base headless consumer then failed compilation with TS2459 at seven
+`Aomi` imports. Restoring that declaration made the same build pass again.
+The mutation was confined to the temporary install and was not committed.
+
+The widget fixture previously inherited `@assistant-ui/react` from the trusted
+workspace root and `@solana/spl-token` from the trusted widget development
+dependencies. The harness supplies those two existing versions explicitly in
+the temporary host. This preserves the original fixture environment without
+allowing candidate package manifests to add new host dependencies silently.
+
+`consumer-baseline.json` pins the owner-reviewed consumer release by full Git SHA.
+Both packed-package and browser checks use it by default; an explicit `--base`
+or `CONSUMER_BASE_SHA` can select another full SHA for local diagnosis. Source is
+always copied unchanged from that commit. Publish its immutable tag before CI;
+missing objects fail closed. No payment-migration exception remains.

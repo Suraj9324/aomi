@@ -1,0 +1,206 @@
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { TransactionSafetyPolicy } from "@aomi-labs/client";
+
+const state = vi.hoisted(() => ({ request: vi.fn() }));
+vi.mock("@/account/transport", async () => {
+  // A real Aomi whose wire is the `state.request(path, init)` stub: a resolved
+  // value is a 200 body; a thrown Error is a failed response with its message.
+  const { Aomi } = await import("@aomi-labs/client");
+  const aomi = new Aomi({
+    baseUrl: "",
+    fetch: async (input, init) => {
+      try {
+        return Response.json(await state.request(String(input), init));
+      } catch (cause) {
+        return new Response((cause as Error).message, { status: 409 });
+      }
+    },
+  });
+  return {
+    useShellTransport: () => ({ aomi }),
+    useShellAomi: () => aomi,
+    useAomi: () => aomi,
+  };
+});
+import { AccountOverviewFixture } from "@/test/account-overview-fixture";
+import { TransactionSafetySettings } from "./transaction-safety-settings";
+
+// Settings always runs under the frame's display cache; saves write into it.
+const renderSettings = () =>
+  render(<TransactionSafetySettings />, { wrapper: AccountOverviewFixture });
+
+const account: TransactionSafetyPolicy = {
+  mode: "balanced",
+  revision: 1,
+  scope: "account_default",
+  source: "default",
+};
+
+const puts = () =>
+  state.request.mock.calls.filter(([, options]) => options?.method === "PUT");
+
+beforeEach(() => {
+  state.request.mockReset().mockResolvedValue(account);
+});
+
+describe("default transaction safety", () => {
+  it("reads only the account default, never a chat or Swig policy", async () => {
+    renderSettings();
+    expect(
+      await screen.findByRole("radio", { name: "Balanced" }),
+    ).toHaveAttribute("aria-checked", "true");
+    const paths = state.request.mock.calls.map(([path]) => String(path));
+    expect(paths).toEqual(["/v1/account/transaction-safety"]);
+    expect(screen.queryByText(/this chat/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /Save/ })).toBeNull();
+  });
+
+  it("opens the policy help on tap and dismisses it with Escape", async () => {
+    renderSettings();
+    const help = await screen.findByRole("button", { name: /^About / });
+    fireEvent.pointerDown(help, { pointerType: "touch" });
+    fireEvent.click(help);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Each new chat");
+    fireEvent.keyDown(help, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull());
+  });
+
+  it("saves on change through the account endpoint with the loaded revision", async () => {
+    let settle!: (policy: TransactionSafetyPolicy) => void;
+    state.request.mockImplementation((_path: string, options?: RequestInit) =>
+      options?.method === "PUT"
+        ? new Promise<TransactionSafetyPolicy>((resolve) => {
+            settle = resolve;
+          })
+        : Promise.resolve(account),
+    );
+    renderSettings();
+    fireEvent.click(await screen.findByRole("radio", { name: "Strict" }));
+
+    await waitFor(() =>
+      expect(state.request).toHaveBeenCalledWith(
+        "/v1/account/transaction-safety",
+        expect.objectContaining({
+          method: "PUT",
+          body: JSON.stringify({ mode: "strict", expectedRevision: 1 }),
+        }),
+      ),
+    );
+    const strict = screen.getByRole("radio", { name: "Strict" });
+    expect(strict).toHaveAccessibleDescription(
+      /Only actions a protocol guard covers/,
+    );
+
+    await act(async () => settle({ ...account, mode: "strict", revision: 2 }));
+    expect(screen.getByRole("radio", { name: "Strict" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
+
+  it("shows a save in flight inside the rows, never as a status line", async () => {
+    let settle!: (policy: TransactionSafetyPolicy) => void;
+    state.request.mockImplementation((_path: string, options?: RequestInit) =>
+      options?.method === "PUT"
+        ? new Promise<TransactionSafetyPolicy>((resolve) => {
+            settle = resolve;
+          })
+        : Promise.resolve(account),
+    );
+    renderSettings();
+    fireEvent.click(await screen.findByRole("radio", { name: "Strict" }));
+    await waitFor(() => expect(settle).toBeTypeOf("function"));
+
+    // The row being saved swaps its check for a spinner; every row is locked.
+    expect(screen.getByRole("radiogroup")).toHaveAttribute("aria-busy", "true");
+    for (const radio of screen.getAllByRole("radio")) {
+      expect(radio).toBeDisabled();
+    }
+    const strict = screen.getByRole("radio", { name: "Strict" });
+    expect(strict).toHaveAttribute("aria-checked", "true");
+    expect(strict.querySelector(".animate-spin")).not.toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+
+    await act(async () => settle({ ...account, mode: "strict", revision: 2 }));
+    expect(screen.getByRole("radiogroup")).not.toHaveAttribute("aria-busy");
+    expect(screen.getByRole("radio", { name: "Balanced" })).toBeEnabled();
+    expect(
+      screen
+        .getByRole("radio", { name: "Strict" })
+        .querySelector(".animate-spin"),
+    ).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByText(/Saved|Saving/)).toBeNull();
+  });
+
+  it("moves between the default-able policies with arrow keys", async () => {
+    state.request.mockImplementation((_path: string, options?: RequestInit) =>
+      Promise.resolve(
+        options?.method === "PUT"
+          ? { ...account, mode: "strict", revision: 2 }
+          : account,
+      ),
+    );
+    renderSettings();
+    const balanced = await screen.findByRole("radio", { name: "Balanced" });
+    fireEvent.keyDown(balanced, { key: "ArrowDown" });
+
+    // Down from Balanced wraps to Strict: Yolo is never a default.
+    await waitFor(() =>
+      expect(state.request).toHaveBeenCalledWith(
+        "/v1/account/transaction-safety",
+        expect.objectContaining({
+          body: JSON.stringify({ mode: "strict", expectedRevision: 1 }),
+        }),
+      ),
+    );
+  });
+
+  it("shows Yolo but never offers it as a default", async () => {
+    renderSettings();
+    const yolo = await screen.findByRole("radio", { name: "Yolo" });
+    expect(yolo).toBeDisabled();
+    fireEvent.click(yolo);
+    expect(puts()).toHaveLength(0);
+    expect(yolo).toHaveAccessibleDescription(/Only inside a chat/);
+  });
+
+  it("reloads a conflicting revision and waits for another explicit change", async () => {
+    let reads = 0;
+    state.request.mockImplementation((_path: string, options?: RequestInit) => {
+      if (options?.method === "PUT")
+        return Promise.reject(
+          new Error("Policy changed in another window. Review and save again."),
+        );
+      return Promise.resolve(
+        ++reads === 1 ? account : { ...account, mode: "strict", revision: 5 },
+      );
+    });
+    renderSettings();
+    fireEvent.click(await screen.findByRole("radio", { name: "Strict" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Policy changed in another window",
+    );
+    await waitFor(() => expect(reads).toBe(2));
+    expect(puts()).toHaveLength(1);
+    expect(screen.queryByText(/^Saved/)).toBeNull();
+    expect(screen.getByRole("radio", { name: "Strict" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
+
+  it("rejects an unknown mode instead of defaulting", async () => {
+    state.request.mockResolvedValue({ ...account, mode: "unknown" });
+    renderSettings();
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.queryByRole("radiogroup")).toBeNull();
+  });
+});

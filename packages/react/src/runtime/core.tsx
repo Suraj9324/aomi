@@ -1,0 +1,769 @@
+"use client";
+
+import { usePrivateApps } from "../control/private-apps";
+
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import type { ReactNode } from "react";
+import type {
+  ExternalStoreAdapter,
+  ThreadMessageLike,
+} from "@assistant-ui/react";
+
+import { AgentApiError, projectConversationEvents } from "@aomi-labs/client";
+import type {
+  ActionCapabilities,
+  CommitCapabilities,
+  AgentTarget,
+  AomiClient,
+  AomiClientOptions,
+} from "@aomi-labs/client";
+import { useControl } from "../contexts/control-context";
+import { useUser } from "../contexts/ext-user-context";
+import { useThreadContext } from "../contexts/thread-context";
+import { useNotification } from "../contexts/notification-context";
+import { useRuntimeOrchestrator } from "./orchestrator";
+import { buildThreadListAdapter } from "./threadlist-adapter";
+import { AomiRuntimeApiProvider, type AomiRuntimeApi } from "../interface";
+import {
+  displayKeyPrefix,
+  useAomiDisplayCache,
+  type RuntimeAccount,
+} from "../query/display-cache";
+import { useActions } from "../actions/use-actions";
+import { useThreadListSync } from "./thread-list-sync";
+import {
+  clearPersistedThreadId,
+  writePersistedThreadId,
+} from "./thread-persistence";
+import {
+  conversationPendingActions,
+  logicalTurnRunning,
+  projectAssistantMessages,
+  projectRuntimeMessages,
+} from "./message-projection";
+import { messageActions } from "./message-actions";
+import { createChatViewStore } from "../state/chat-view-store";
+import {
+  AssistantRuntimeBoundary,
+  ChatBoundaryContext,
+  type ChatBoundaryValue,
+} from "./assistant-runtime-boundary";
+import { describeSendFailure } from "./send-error-notices";
+import { privateAppKey } from "./private-app-key";
+import { accountChange, type RuntimeOwner } from "./account-change";
+import {
+  hasConversation,
+  isSending,
+  isStreamingTextOnly,
+  isTurnStopped,
+} from "./turn-state";
+
+// A failed history read gets one quiet retry after this delay.
+const THREAD_LOAD_RETRY_DELAY_MS = 1500;
+
+// Native conversion caches are scoped to the chat runtime. A new converter
+// identity clears them, including when only shell metadata has changed.
+const identityMessage = (message: ThreadMessageLike) => message;
+const NO_MESSAGES: ThreadMessageLike[] = [];
+
+/** Deduplicate in-flight async work keyed by thread id. */
+async function runSingleFlight(
+  flights: Map<string, Promise<void>>,
+  threadId: string,
+  work: () => Promise<void>,
+): Promise<void> {
+  const existing = flights.get(threadId);
+  if (existing) return existing;
+
+  const promise = work();
+  flights.set(threadId, promise);
+  try {
+    await promise;
+  } finally {
+    if (flights.get(threadId) === promise) {
+      flights.delete(threadId);
+    }
+  }
+}
+
+export type AomiRuntimeCoreProps = {
+  children: ReactNode;
+  aomiClient: AomiClient;
+  account?: RuntimeAccount | null;
+  accountAuthSource?:
+    | AomiClientOptions["getAccountBearer"]
+    | AomiClientOptions["oauth"];
+  agentTarget?: AgentTarget;
+  actions?: ActionCapabilities;
+  commits?: CommitCapabilities;
+  accountSessionAvailable?: boolean;
+  restoredThreadId?: string;
+  threadPersistenceKey?: string | null;
+};
+
+export function AomiRuntimeCore({
+  children,
+  aomiClient,
+  account,
+  accountAuthSource,
+  agentTarget,
+  actions: actionCapabilities,
+  commits: commitCapabilities,
+  accountSessionAvailable = false,
+  restoredThreadId,
+  threadPersistenceKey,
+}: Readonly<AomiRuntimeCoreProps>) {
+  const threadContext = useThreadContext();
+  const threadContextRef = useRef(threadContext);
+  threadContextRef.current = threadContext;
+  const [chatView] = useState(() => createChatViewStore());
+  const chatGeneration = useSyncExternalStore(
+    chatView.subscribe,
+    chatView.version,
+    chatView.version,
+  );
+  const readComposerTextRef = useRef<() => string>(() => "");
+  const restoreComposerTextRef = useRef<(text: string) => void>(() => {});
+  const notificationContext = useNotification();
+  const rateLimitNotice = useRef<string | undefined>(undefined);
+  const userContext = useUser();
+  const {
+    getControlState,
+    getCurrentThreadControl,
+    getCurrentThreadTarget,
+    getPreferredThreadControl,
+    markControlSynced,
+  } = useControl();
+  const privateApps = usePrivateApps();
+  const displayCache = useAomiDisplayCache();
+  const displayCacheRef = useRef(displayCache);
+  displayCacheRef.current = displayCache;
+  // Chats the backend knows about; the rest exist only in this tab so far.
+  const remoteThreadIdsRef = useRef(new Set<string>());
+  const cancelPromisesRef = useRef(new Map<string, Promise<void>>());
+
+  const forgetPersistedThread = useCallback(() => {
+    if (threadPersistenceKey) clearPersistedThreadId(threadPersistenceKey);
+  }, [threadPersistenceKey]);
+  /** Drop what this tab remembers about the chats that were just closed. */
+  const forgetConversations = useCallback(() => {
+    remoteThreadIdsRef.current.clear();
+    chatView.clear();
+    forgetPersistedThread();
+  }, [chatView, forgetPersistedThread]);
+
+  const {
+    sessionManager,
+    currentSession,
+    snapshot,
+    getSession,
+    ensureInitialState,
+    isLoading,
+    isLoaded,
+    hasLoadFailed,
+    retryLoad,
+    sendMessage: orchestratorSendMessage,
+    cancelGeneration: orchestratorCancel,
+    closeSession,
+    closeAllSessions,
+    aomiClientRef,
+  } = useRuntimeOrchestrator(aomiClient, {
+    getUserState: userContext.getUserState,
+    getTarget: () => agentTarget ?? getCurrentThreadTarget(),
+    getAppKey: (target, text) =>
+      privateAppKey(target, text, privateApps.getKey, (id) =>
+        getControlState().appDescriptors.some(
+          (app) => app.isPublic === false && String(app.applicationId) === id,
+        ),
+      ),
+    getModel: () => {
+      const control = getCurrentThreadControl();
+      return control.modelMode === "manual" ? control.model : null;
+    },
+    getClientId: () => getControlState().clientId ?? undefined,
+    getActions: () => actionCapabilities,
+    getCommits: () => commitCapabilities,
+    onGuestExpired: forgetConversations,
+    onTurnEnded: () => {
+      const cache = displayCacheRef.current;
+      if (cache?.scope.account?.kind === "user")
+        void cache.client.invalidateQueries({
+          queryKey: cache.key("credits"),
+          exact: true,
+        });
+    },
+    onSendSuccess: (threadId) => {
+      if (rateLimitNotice.current) {
+        notificationContext.dismissNotification(rateLimitNotice.current);
+        rateLimitNotice.current = undefined;
+      }
+      const wasRemote = remoteThreadIdsRef.current.has(threadId);
+      remoteThreadIdsRef.current.add(threadId);
+      if (threadPersistenceKey)
+        writePersistedThreadId(threadPersistenceKey, threadId);
+      if (!wasRemote && threadContextRef.current.currentThreadId === threadId)
+        markControlSynced();
+    },
+    isSavedThread: (threadId) => remoteThreadIdsRef.current.has(threadId),
+    onSendError: (threadId, error) => {
+      // Only a Direct target names the app. Auto threads keep the last
+      // Direct app in control, so scoping to it could reject the right key.
+      const control =
+        threadContextRef.current.getThreadMetadata(threadId)?.control;
+      const target =
+        agentTarget?.mode === "direct"
+          ? agentTarget
+          : !agentTarget && control?.agentMode === "direct"
+            ? control
+            : undefined;
+      const failure = describeSendFailure(
+        error,
+        Boolean(sessionManager.get(threadId)?.getSnapshot().isStartUncertain),
+        Boolean(target?.app || target?.applicationId != null),
+      );
+      if (failure.forgetThread) forgetPersistedThread();
+      if (
+        error instanceof AgentApiError &&
+        (error.appAccessCode === "app_key_required" ||
+          error.appAccessCode === "app_key_not_scoped")
+      ) {
+        failure.notice.appKeyTarget =
+          target?.app || target?.applicationId != null
+            ? {
+                app: target.app ?? undefined,
+                applicationId:
+                  target.applicationId != null
+                    ? Number(target.applicationId)
+                    : undefined,
+              }
+            : {};
+        failure.notice.duration = Infinity;
+      }
+      if (failure.rateLimited && rateLimitNotice.current)
+        notificationContext.dismissNotification(rateLimitNotice.current);
+      const noticeId = notificationContext.showNotification(failure.notice);
+      if (failure.rateLimited) rateLimitNotice.current = noticeId;
+    },
+  });
+
+  const actions = useActions(currentSession);
+  // Consumers see the visible conversation, as the chat renders it: an Edit
+  // or Rerun hides the turns it replaced. SessionSnapshot.events keeps the
+  // whole ledger for receipts and audit.
+  const events = useMemo(
+    () => projectConversationEvents(snapshot.events),
+    [snapshot.events],
+  );
+  const pendingActions = useMemo(
+    () => conversationPendingActions(actions.pendingActions, events),
+    [actions.pendingActions, events],
+  );
+
+  /**
+   * Close every chat and forget it. With `carryDraft`, the unsent composer
+   * text moves along, and an empty chat keeps its id.
+   */
+  const resetConversation = useCallback(
+    (carryDraft = false) => {
+      const threads = threadContextRef.current;
+      const currentId = threads.currentThreadId;
+      const draft = carryDraft
+        ? {
+            draft: readComposerTextRef.current(),
+            mentions: chatView.get(currentId)?.mentions,
+          }
+        : undefined;
+      const started = hasConversation(
+        sessionManager.get(currentId)?.getSnapshot(),
+      );
+      closeAllSessions();
+      forgetConversations();
+      const nextId = draft && !started ? currentId : threads.resetToDefault();
+      if (draft) chatView.patch(nextId, draft);
+    },
+    [chatView, closeAllSessions, forgetConversations, sessionManager],
+  );
+
+  const scope = displayCache?.scope;
+  const owner: RuntimeOwner = {
+    backendUrl: scope?.backendUrl ?? "",
+    appId: scope?.appId ?? "",
+    account,
+    authSource: accountAuthSource,
+  };
+  const previousOwner = useRef(owner);
+  // A replacement wallet adapter must confirm the account before closing its chats.
+  const restoringAccount =
+    account === undefined && previousOwner.current.account !== undefined;
+  useLayoutEffect(() => {
+    if (
+      restoringAccount &&
+      previousOwner.current.backendUrl === owner.backendUrl &&
+      previousOwner.current.appId === owner.appId
+    )
+      return;
+    const change = accountChange(previousOwner.current, owner);
+    previousOwner.current = owner;
+    if (change !== "keep") resetConversation(change === "sign-in");
+  });
+
+  const listAccount = restoringAccount
+    ? previousOwner.current.account
+    : account;
+  const userId = listAccount?.kind === "user" ? listAccount.id : null;
+  // Bumped when the account's data changed under the same id (a merge).
+  const [accountRevision, setAccountRevision] = useState(0);
+  // The list belongs to the identity its requests carry. An account that was
+  // still unknown when the list was requested is the one it resolves to (the
+  // chats are kept for that change too), so only a change between known
+  // identities, including a saved preview's, starts another list.
+  const previewAccount = displayCache?.restoredAccount;
+  const knownUser =
+    listAccount !== undefined
+      ? userId
+      : previewAccount?.kind === "user"
+        ? previewAccount.id
+        : undefined;
+  const listIdentity = useRef<{ user?: string | null; epoch: number }>({
+    epoch: 0,
+  });
+  if (knownUser !== undefined && listIdentity.current.user !== knownUser) {
+    listIdentity.current = {
+      user: knownUser,
+      epoch:
+        listIdentity.current.epoch +
+        (listIdentity.current.user === undefined ? 0 : 1),
+    };
+  }
+  const listEpoch = listIdentity.current.epoch;
+  const listOwner = useMemo(
+    () => ({
+      backendUrl: owner.backendUrl,
+      appId: owner.appId,
+      listEpoch,
+      accountRevision,
+    }),
+    [owner.backendUrl, owner.appId, listEpoch, accountRevision],
+  );
+  const refreshAccountData = useCallback(() => {
+    const cache = displayCacheRef.current;
+    if (cache?.scope.account) {
+      cache.client.removeQueries({
+        queryKey: cache.key("threads"),
+        exact: true,
+      });
+      void cache.client.invalidateQueries({
+        queryKey: displayKeyPrefix(cache.scope, cache.scope.account),
+      });
+    }
+    setAccountRevision((revision) => revision + 1);
+  }, []);
+  const {
+    isThreadListLoading,
+    isThreadListRevalidating,
+    threadListError,
+    canLoadThreads,
+  } = useThreadListSync({
+    restoringAccount,
+    aomiClientRef,
+    sessionManager,
+    ensureInitialState,
+    resetConversation,
+    remoteThreadIdsRef,
+    accountSessionAvailable,
+    owner: listOwner,
+    restoredThreadId,
+    onInvalidRestoredThread: forgetPersistedThread,
+  });
+
+  const currentThreadId = threadContext.currentThreadId;
+  const isSavedThread = remoteThreadIdsRef.current.has(currentThreadId);
+  // One quiet automatic retry per failure before the chat shows the error.
+  const autoRetry = useRef(new Map<string, "scheduled" | "used">());
+  const loadFailed = isSavedThread && hasLoadFailed(currentThreadId);
+  const threadLoadError =
+    loadFailed && autoRetry.current.get(currentThreadId) === "used";
+  const isThreadLoading = isSavedThread
+    ? isLoading(currentThreadId) || (loadFailed && !threadLoadError)
+    : // The restored chat loads beside the list; until the list confirms it,
+      // a failed attempt still reads as loading rather than a new chat.
+      currentThreadId === restoredThreadId &&
+      isThreadListRevalidating &&
+      !isLoaded(currentThreadId);
+  useEffect(() => {
+    if (!remoteThreadIdsRef.current.has(currentThreadId)) return;
+    ensureInitialState(currentThreadId).catch((error) =>
+      console.debug("Failed to load chat:", currentThreadId, error),
+    );
+  }, [ensureInitialState, currentThreadId]);
+  useEffect(() => {
+    const threadId = currentThreadId;
+    if (!loadFailed || autoRetry.current.has(threadId)) return;
+    autoRetry.current.set(threadId, "scheduled");
+    const timer = setTimeout(() => {
+      autoRetry.current.set(threadId, "used");
+      retryLoad(threadId).then(
+        () => autoRetry.current.delete(threadId),
+        (error) => console.debug("Failed to load chat:", threadId, error),
+      );
+    }, THREAD_LOAD_RETRY_DELAY_MS);
+    return () => {
+      clearTimeout(timer);
+      if (autoRetry.current.get(threadId) === "scheduled")
+        autoRetry.current.delete(threadId);
+    };
+  }, [loadFailed, currentThreadId, retryLoad]);
+  const retryThreadLoad = useCallback(() => {
+    const threadId = threadContextRef.current.currentThreadId;
+    retryLoad(threadId).then(
+      () => autoRetry.current.delete(threadId),
+      (error) => console.debug("Failed to load chat:", threadId, error),
+    );
+  }, [retryLoad]);
+  /** Start reading a chat's history before it is selected. */
+  const prefetchThread = useCallback(
+    (threadId: string) => {
+      if (!canLoadThreads) return;
+      ensureInitialState(threadId).catch((error) =>
+        console.debug("Failed to prefetch chat:", threadId, error),
+      );
+    },
+    [canLoadThreads, ensureInitialState],
+  );
+
+  // The server's user event can trail the start response by a poll or two.
+  // Echo it immediately with the same ordinal id the server's own event will
+  // get, so the previous reply stays complete and no phantom branch appears.
+  const messages = useMemo(
+    () =>
+      projectRuntimeMessages(
+        snapshot.events,
+        snapshot.pendingUserMessage,
+        snapshot.liveMessages,
+        snapshot.stoppedTurnId,
+        snapshot.terminalTurns,
+        snapshot.pendingReplacesMessageKey,
+        snapshot.pendingSteers,
+      ),
+    [
+      snapshot.events,
+      snapshot.pendingUserMessage,
+      snapshot.liveMessages,
+      snapshot.stoppedTurnId,
+      snapshot.terminalTurns,
+      snapshot.pendingReplacesMessageKey,
+      snapshot.pendingSteers,
+    ],
+  );
+  const isRunning =
+    isSending(snapshot) ||
+    (!isTurnStopped(snapshot) &&
+      !snapshot.terminalTurns?.some(
+        (turn) => turn.turnId === snapshot.turnId,
+      ) &&
+      logicalTurnRunning(
+        snapshot.events,
+        messages,
+        snapshot.turnState,
+        snapshot.isSubmitting,
+        snapshot.pendingUserMessage,
+      ));
+
+  useEffect(() => {
+    if (!threadPersistenceKey) return;
+    if (!remoteThreadIdsRef.current.has(currentThreadId)) return;
+    writePersistedThreadId(threadPersistenceKey, currentThreadId);
+  }, [threadContext.allThreadsMetadata, currentThreadId, threadPersistenceKey]);
+
+  const threadListAdapter = useMemo(
+    () =>
+      buildThreadListAdapter({
+        aomiClientRef,
+        threadContext,
+        isLoading: isThreadListLoading,
+        getInitialControl: getPreferredThreadControl,
+        isRemoteThread: (threadId) =>
+          remoteThreadIdsRef.current.has(threadId) ||
+          Boolean(threadContext.getThreadMetadata(threadId)?.pending) ||
+          Boolean(sessionManager.get(threadId)?.getSnapshot().turnId),
+      }),
+    [
+      aomiClientRef,
+      getPreferredThreadControl,
+      isThreadListLoading,
+      threadContext,
+      sessionManager,
+    ],
+  );
+
+  const cancelThreadGeneration = useCallback(
+    (threadId: string) =>
+      runSingleFlight(cancelPromisesRef.current, threadId, async () => {
+        try {
+          await orchestratorCancel(threadId);
+        } catch (error) {
+          const current = sessionManager.get(threadId)?.getSnapshot();
+          const retryable =
+            current?.isStartUncertain ||
+            current?.turnState === "processing" ||
+            current?.turnState === "awaiting_action";
+          notificationContext.showNotification({
+            type: "error",
+            title: "Unable to stop generation",
+            message: `${error instanceof Error ? error.message : "The Stop request failed"}. ${retryable ? "Generation may still be running. Try Stop again." : "Refresh the conversation to check its status."}`,
+          });
+        }
+      }),
+    [orchestratorCancel, notificationContext, sessionManager],
+  );
+  const assistantAdapter: ExternalStoreAdapter<ThreadMessageLike> = {
+    messages,
+    isLoading: isThreadLoading,
+    isRunning,
+    ...messageActions({
+      messages,
+      send: (text, options) =>
+        orchestratorSendMessage(text, currentThreadId, options),
+      restore: (text) => {
+        // The chats this failure belongs to were closed since.
+        if (chatView.version() !== chatGeneration) return;
+        // A late failure belongs to the originating chat, not the newly selected composer.
+        if (threadContextRef.current.currentThreadId === currentThreadId)
+          restoreComposerTextRef.current(text);
+        else chatView.patch(currentThreadId, { draft: text });
+      },
+      unavailable: (message) =>
+        notificationContext.showNotification({
+          type: "error",
+          title: "Message action unavailable",
+          message,
+        }),
+    }),
+    onCancel: async () => {
+      await cancelThreadGeneration(currentThreadId);
+    },
+    convertMessage: identityMessage,
+    adapters: { threadList: threadListAdapter },
+  };
+
+  useEffect(() => () => chatView.clear(), [chatView]);
+
+  const sendMessage = useCallback(
+    async (text: string) => {
+      await orchestratorSendMessage(text, currentThreadId);
+    },
+    [orchestratorSendMessage, currentThreadId],
+  );
+
+  const cancelGeneration = useCallback(() => {
+    void cancelThreadGeneration(currentThreadId);
+  }, [cancelThreadGeneration, currentThreadId]);
+
+  const getMessages = useCallback(
+    (threadId?: string) => {
+      const session = sessionManager.get(threadId ?? currentThreadId);
+      return session
+        ? projectAssistantMessages(session.getSnapshot().events)
+        : [];
+    },
+    [currentThreadId, sessionManager],
+  );
+
+  const createThread = useCallback(async (): Promise<string> => {
+    await threadListAdapter.onSwitchToNewThread();
+    return threadContextRef.current.currentThreadId;
+  }, [threadListAdapter]);
+
+  const deleteThread = useCallback(
+    async (threadId: string) => {
+      closeSession(threadId);
+      await threadListAdapter.onDelete(threadId);
+      chatView.delete(threadId);
+      remoteThreadIdsRef.current.delete(threadId);
+      const nextThreadId = threadContextRef.current.currentThreadId;
+      if (!remoteThreadIdsRef.current.has(nextThreadId))
+        forgetPersistedThread();
+    },
+    [chatView, closeSession, forgetPersistedThread, threadListAdapter],
+  );
+
+  const selectThread = useCallback(
+    (threadId: string) => {
+      if (threadContextRef.current.getThreadMetadata(threadId)) {
+        threadListAdapter.onSwitchToThread(threadId);
+      } else {
+        void threadListAdapter.onSwitchToNewThread();
+      }
+    },
+    [threadListAdapter],
+  );
+
+  const simulateBatchTransactions = useCallback<
+    AomiRuntimeApi["simulateBatchTransactions"]
+  >(
+    async (transactions, options) => {
+      const session =
+        sessionManager.get(currentThreadId) ?? getSession(currentThreadId);
+      const response = await session.client.simulateBatch(
+        session.sessionId,
+        transactions,
+        options,
+      );
+      return response.result;
+    },
+    [getSession, sessionManager, currentThreadId],
+  );
+
+  const aomiRuntimeApi: AomiRuntimeApi = useMemo(
+    () => ({
+      account: aomiClient.account,
+      transactionSafety: aomiClient.transactionSafety,
+      refreshAccountData,
+      // User API
+      user: userContext.user,
+      getUserState: userContext.getUserState,
+      setUser: userContext.setUser,
+      addExtValue: userContext.addExtValue,
+      removeExtValue: userContext.removeExtValue,
+
+      // Thread API
+      currentThreadId,
+      threadViewKey: threadContext.threadViewKey,
+      threadMetadata: threadContext.allThreadsMetadata,
+      threadListError,
+      threadListLoading: isThreadListLoading,
+      threadListRevalidating: isThreadListRevalidating,
+      threadLoadError,
+      retryThreadLoad,
+      prefetchThread,
+      isRemoteThread: (threadId) =>
+        remoteThreadIdsRef.current.has(threadId) ||
+        Boolean(sessionManager.get(threadId)?.getSnapshot().turnId),
+      getThreadMetadata: threadContext.getThreadMetadata,
+      createThread,
+      deleteThread,
+      renameThread: (threadId, title) =>
+        threadListAdapter.onRename(threadId, title),
+      archiveThread: (threadId) => threadListAdapter.onArchive(threadId),
+      selectThread,
+
+      // Chat API
+      isRunning,
+      isSubmitting: snapshot.isSubmitting,
+      isStartUncertain: Boolean(snapshot.isStartUncertain),
+      isStopping: snapshot.isStopping ?? false,
+      getMessages,
+      sendMessage,
+      cancelGeneration,
+
+      // Notification API
+      notifications: notificationContext.notifications,
+      showNotification: notificationContext.showNotification,
+      dismissNotification: notificationContext.dismissNotification,
+      clearAllNotifications: notificationContext.clearAll,
+
+      // Action API
+      pendingActions,
+      commits: snapshot.commits,
+      commitController: currentSession?.commits,
+      actionAttempts: actions.actionAttempts,
+      hasBlockingActions: actions.hasBlockingActions,
+      executeAction: actions.executeAction,
+      respondToAction: actions.respondToAction,
+      rejectAction: actions.rejectAction,
+      simulateBatchTransactions,
+
+      events,
+      turnState: snapshot.turnState,
+    }),
+    [
+      userContext,
+      aomiClient.account,
+      aomiClient.transactionSafety,
+      refreshAccountData,
+      currentThreadId,
+      threadContext.threadViewKey,
+      threadContext.allThreadsMetadata,
+      threadContext.getThreadMetadata,
+      threadListError,
+      threadLoadError,
+      retryThreadLoad,
+      prefetchThread,
+      createThread,
+      isThreadListLoading,
+      isThreadListRevalidating,
+      sessionManager,
+      deleteThread,
+      threadListAdapter,
+      selectThread,
+      isRunning,
+      snapshot.isSubmitting,
+      snapshot.isStartUncertain,
+      snapshot.isStopping,
+      getMessages,
+      sendMessage,
+      cancelGeneration,
+      notificationContext,
+      actions,
+      pendingActions,
+      currentSession,
+      simulateBatchTransactions,
+      events,
+      snapshot.commits,
+      snapshot.turnState,
+    ],
+  );
+
+  // Hosts that never render AomiChatBoundary get the chat in the shell's
+  // runtime, replaced on each chat switch so message indices stay in step.
+  const [boundaryRendered, setBoundaryRendered] = useState(false);
+  const onBoundaryMount = useCallback(() => setBoundaryRendered(true), []);
+  const firstThreadId = useRef(currentThreadId).current;
+  const chat: ChatBoundaryValue = {
+    threadId: currentThreadId,
+    adapter: assistantAdapter,
+    restoreComposerText: restoreComposerTextRef,
+    readComposerText: readComposerTextRef,
+    store: chatView,
+    generation: chatGeneration,
+    deferMessages: isStreamingTextOnly(snapshot),
+    onBoundaryMount,
+  };
+  return (
+    <AomiRuntimeApiProvider value={aomiRuntimeApi}>
+      <AssistantRuntimeBoundary
+        key={
+          boundaryRendered || currentThreadId === firstThreadId
+            ? "shell"
+            : currentThreadId
+        }
+        adapter={
+          boundaryRendered
+            ? {
+                ...assistantAdapter,
+                messages: NO_MESSAGES,
+                isRunning: false,
+                isLoading: false,
+              }
+            : assistantAdapter
+        }
+        restoreComposerText={
+          boundaryRendered ? undefined : restoreComposerTextRef
+        }
+        readComposerText={boundaryRendered ? undefined : readComposerTextRef}
+      >
+        <ChatBoundaryContext.Provider value={chat}>
+          {children}
+        </ChatBoundaryContext.Provider>
+      </AssistantRuntimeBoundary>
+    </AomiRuntimeApiProvider>
+  );
+}

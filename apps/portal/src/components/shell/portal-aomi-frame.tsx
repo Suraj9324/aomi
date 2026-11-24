@@ -1,0 +1,612 @@
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import type { AomiRoutingConfig, DirectRoutingApp } from "@aomi-labs/widget";
+import { AomiFrame } from "@aomi-labs/widget/frame";
+import {
+  DEFAULT_SIDEBAR_PRODUCTS,
+  getBackendUrl,
+  HeaderControls,
+  PackagesModal,
+  SettingsModal,
+  useAccountOverview,
+  useAccountSnapshot,
+  useAomiWalletKit,
+  usePortalWalletAccountMenu,
+  useRuntimeAccount,
+  useSettingsOpenRequest,
+  type PolicyFocus,
+  type SettingsTab,
+  type WalletAccountMenuOptions,
+} from "@aomi-labs/widget/host-composition";
+import { useAomiRuntime } from "@aomi-labs/react";
+import { OverlayPortal } from "@/components/shell/overlay-portal";
+import {
+  usePortalClientOptions,
+  useRequestedAppConfig,
+} from "@/lib/portal-client-options";
+import { SvmWalletBindingGate } from "@aomi-labs/widget/host-composition";
+
+const DEFAULT_ENABLED_APPS = ["default"] as const;
+const SETTINGS_TABS: readonly SettingsTab[] = [
+  "general",
+  "account",
+  "connections",
+  "policies",
+  "policy",
+  "usage",
+];
+
+function directTarget(
+  app: string,
+  applicationId: string | null,
+): DirectRoutingApp {
+  const parsed = applicationId === null ? NaN : Number(applicationId);
+  return Number.isSafeInteger(parsed) && parsed > 0
+    ? { app, applicationId: parsed }
+    : { app };
+}
+
+const AUTO_ROUTING: AomiRoutingConfig = { targets: [{ mode: "auto" }] };
+
+/**
+ * Portal chats always run Auto; users tag apps with the composer's + picker.
+ * An unlocked `?app=` link pre-tags its app the same way; only a locked
+ * project link pins its app, silently, as a Direct target.
+ */
+function PortalComposer({
+  lockedTarget,
+  appTag,
+  sendDisabled,
+  opening,
+}: {
+  lockedTarget?: DirectRoutingApp;
+  appTag?: { app: string; applicationId?: number };
+  sendDisabled: boolean;
+  opening: boolean;
+}) {
+  // A list that failed never confirms the link; the new chat is usable then.
+  const { threadListError } = useAomiRuntime();
+  const enabledApps = useAccountOverview()?.user.apps ?? DEFAULT_ENABLED_APPS;
+  const routing = useMemo<AomiRoutingConfig>(
+    () =>
+      lockedTarget
+        ? {
+            targets: [{ mode: "direct", apps: [lockedTarget] }],
+            defaultMode: "direct",
+          }
+        : AUTO_ROUTING,
+    [lockedTarget],
+  );
+  return (
+    <AomiFrame.Composer
+      withControl
+      sendDisabled={sendDisabled && !threadListError}
+      opening={opening && !threadListError}
+      controlBarProps={{
+        hideApiKey: true,
+        routing,
+        enabledAppIds: enabledApps,
+        initialAppTag: appTag,
+        hideNetwork: true,
+      }}
+    />
+  );
+}
+
+/** Open the account's thread linked by MCP wallet-approval handoff. */
+type ThreadUrlSnapshot = {
+  navigating: boolean;
+  requestedThread: string | null | undefined;
+};
+
+export function createThreadUrlNavigation() {
+  let snapshot: ThreadUrlSnapshot = {
+    navigating: true,
+    requestedThread: undefined,
+  };
+  const listeners = new Set<() => void>();
+  const update = (next: ThreadUrlSnapshot) => {
+    snapshot = next;
+    listeners.forEach((listener) => listener());
+  };
+  return {
+    getSnapshot: () => snapshot,
+    subscribe: (listener: () => void) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    navigate: (requestedThread: string | null) =>
+      update({ navigating: true, requestedThread }),
+    settle: () => update({ ...snapshot, navigating: false }),
+    sync: (requestedThread: string | null) =>
+      update({ navigating: false, requestedThread }),
+  };
+}
+export type ThreadUrlNavigation = ReturnType<typeof createThreadUrlNavigation>;
+
+export function ThreadUrlBootstrap({
+  ready = true,
+  navigation,
+}: {
+  ready?: boolean;
+  navigation?: ThreadUrlNavigation;
+}) {
+  const {
+    currentThreadId,
+    selectThread,
+    createThread,
+    threadMetadata,
+    getThreadMetadata,
+    threadListLoading: listLoading,
+    threadListRevalidating,
+    threadListError,
+    showNotification,
+    events = [],
+    isRemoteThread,
+    prefetchThread,
+  } = useAomiRuntime();
+  const threadListLoading = threadListRevalidating ?? listLoading;
+  const [localNavigation] = useState(createThreadUrlNavigation);
+  const locationState = navigation ?? localNavigation;
+  const navigationSnapshot = useSyncExternalStore(
+    locationState.subscribe,
+    locationState.getSnapshot,
+    locationState.getSnapshot,
+  );
+  const { navigating, requestedThread } = navigationSnapshot;
+  useEffect(() => {
+    const readLocation = () => {
+      locationState.navigate(
+        new URLSearchParams(window.location.search).get("thread")?.trim() ||
+          null,
+      );
+    };
+    // Assistant-ui's per-chat boundary remounts this subtree. Only initial
+    // host restoration or browser navigation should reopen the current URL.
+    if (locationState.getSnapshot().requestedThread === undefined) {
+      readLocation();
+      // A blank initial URL has no owned chat to restore. Finish it before
+      // the account read so a click on cached history is not replaced by New
+      // chat when that read completes. Linked URLs still wait for validation.
+      if (locationState.getSnapshot().requestedThread === null)
+        locationState.settle();
+    }
+    window.addEventListener("popstate", readLocation);
+    return () => window.removeEventListener("popstate", readLocation);
+  }, [locationState]);
+
+  // The linked chat's history loads while the list that validates it does.
+  useEffect(() => {
+    if (ready && navigating && requestedThread)
+      prefetchThread?.(requestedThread);
+  }, [ready, navigating, requestedThread, prefetchThread]);
+
+  useEffect(() => {
+    if (locationState.getSnapshot() !== navigationSnapshot) return;
+    if (
+      !ready ||
+      !navigating ||
+      requestedThread === undefined ||
+      threadListError
+    )
+      return;
+    if (requestedThread) {
+      // A list can publish its store before this effect's rendered map catches
+      // up. Validate the current owned store, including real archive/removal.
+      // An owned chat is opened as soon as any list page lists it; only the
+      // "unavailable" verdict needs every page.
+      const metadata = getThreadMetadata(requestedThread);
+      if (metadata && metadata.status !== "archived") {
+        if (requestedThread !== currentThreadId) {
+          selectThread(requestedThread);
+          return;
+        }
+      } else if (threadListLoading) {
+        return;
+      } else {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("thread");
+        window.history.replaceState(null, "", url);
+        showNotification({
+          type: "error",
+          title: "Conversation unavailable",
+          message:
+            "This chat may have been archived or belongs to another account. Start a new chat or choose one from Recent.",
+        });
+        locationState.navigate(null);
+        void createThread();
+        return;
+      }
+    } else if (threadListLoading) {
+      return;
+    } else if (isRemoteThread?.(currentThreadId) ?? events.length > 0) {
+      void createThread();
+      return;
+    }
+    if (threadListLoading) return;
+    locationState.settle();
+  }, [
+    ready,
+    requestedThread,
+    currentThreadId,
+    createThread,
+    selectThread,
+    threadMetadata,
+    getThreadMetadata,
+    threadListLoading,
+    threadListError,
+    showNotification,
+    events,
+    isRemoteThread,
+    locationState,
+    navigating,
+    navigationSnapshot,
+  ]);
+
+  useEffect(() => {
+    const latest = locationState.getSnapshot();
+    if (latest !== navigationSnapshot) return;
+    if (
+      !ready ||
+      threadListLoading ||
+      latest.navigating ||
+      latest.requestedThread === undefined
+    )
+      return;
+    const url = new URL(window.location.href);
+    const locationThread = url.searchParams.get("thread")?.trim() || null;
+    // Next can render its changed search params before our popstate listener
+    // runs. A changed browser location wins over this render's old chat.
+    if (locationThread !== latest.requestedThread) {
+      locationState.navigate(locationThread);
+      return;
+    }
+    const metadata = getThreadMetadata(currentThreadId);
+    const threadId =
+      metadata &&
+      (isRemoteThread?.(currentThreadId) ?? metadata.title !== "New Chat") &&
+      metadata.status !== "archived"
+        ? currentThreadId
+        : null;
+    if (url.searchParams.get("thread") === threadId) return;
+    if (threadId) url.searchParams.set("thread", threadId);
+    else url.searchParams.delete("thread");
+    window.history.pushState(null, "", url);
+    locationState.sync(threadId);
+  }, [
+    ready,
+    currentThreadId,
+    threadMetadata,
+    getThreadMetadata,
+    requestedThread,
+    isRemoteThread,
+    threadListLoading,
+    locationState,
+    navigating,
+    navigationSnapshot,
+  ]);
+
+  return null;
+}
+
+function PortalHeaderControls({
+  onOpenSettings,
+  onOpenPackages,
+}: {
+  onOpenSettings: () => void;
+  onOpenPackages: () => void;
+}) {
+  const { accountUser, accountGuest, accountStatus, isReady } =
+    useAomiWalletKit();
+  const [snapshot] = useAccountSnapshot();
+  const pending = isReady === false || accountStatus === "loading";
+  return (
+    <HeaderControls
+      showSettings={
+        pending ? Boolean(snapshot) : Boolean(accountUser && !accountGuest)
+      }
+      onOpenSettings={onOpenSettings}
+      onOpenPackages={onOpenPackages}
+    />
+  );
+}
+
+function PortalFrameContents({
+  openSettings,
+  onWalletAccountMenuChange,
+  ready,
+  navigation,
+}: {
+  openSettings: (tab: SettingsTab) => void;
+  onWalletAccountMenuChange: (
+    menu: WalletAccountMenuOptions | undefined,
+  ) => void;
+  ready: boolean;
+  navigation: ThreadUrlNavigation;
+}) {
+  // AomiFrame.Root creates the runtime provider. Keep this hook in its
+  // subtree; calling it in PortalAomiFrame would read the provider before it
+  // exists and make the real portal route fail during server rendering.
+  const walletAccountMenu = usePortalWalletAccountMenu(
+    useCallback(() => openSettings("general"), [openSettings]),
+    useCallback(() => openSettings("account"), [openSettings]),
+  );
+
+  useEffect(() => {
+    onWalletAccountMenuChange(walletAccountMenu);
+  }, [onWalletAccountMenuChange, walletAccountMenu]);
+
+  return <ThreadUrlBootstrap ready={ready} navigation={navigation} />;
+}
+
+export function PortalAomiFrame() {
+  const { accountStatus, isReady } = useAomiWalletKit();
+  const account = useRuntimeAccount();
+  const [accountFrameScope, setAccountFrameScope] = useState(() => ({
+    account,
+    initialized: false,
+    revision: 0,
+    clearThreadUrl: false,
+  }));
+  const requestedApp = useRequestedAppConfig();
+  const lockedApp = requestedApp.locked ? requestedApp.app : null;
+  const lockedApplicationId = lockedApp ? requestedApp.applicationId : null;
+  const lockedTarget = useMemo(
+    () =>
+      lockedApp ? directTarget(lockedApp, lockedApplicationId) : undefined,
+    [lockedApp, lockedApplicationId],
+  );
+  const appTag = useMemo(
+    () =>
+      requestedApp.app && !requestedApp.locked
+        ? {
+            ...directTarget(requestedApp.app, requestedApp.applicationId),
+            app: requestedApp.app,
+          }
+        : undefined,
+    [requestedApp.app, requestedApp.applicationId, requestedApp.locked],
+  );
+  const clientOptions = usePortalClientOptions(lockedApp, lockedApplicationId);
+  const backendUrl = getBackendUrl();
+  // Settings and the packages catalog are siblings of the frame so their
+  // backdrops cover the sidebar and chat as one surface.
+  const [overlay, setOverlay] = useState<"none" | "settings" | "packages">(
+    "none",
+  );
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
+  const [policyFocus, setPolicyFocus] = useState<PolicyFocus>();
+  const [initialTopUp, setInitialTopUp] = useState(false);
+  const [handoffMismatch, setHandoffMismatch] = useState(false);
+  const [handoffOwner, setHandoffOwner] = useState<string | null>(null);
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const expected = url.searchParams.get("expectedAccount");
+    if (expected) {
+      if (
+        account === undefined ||
+        isReady === false ||
+        accountStatus === "loading"
+      )
+        return;
+      url.searchParams.delete("expectedAccount");
+      if (account?.id !== expected) {
+        url.searchParams.delete("topup");
+        url.searchParams.delete("settings");
+        window.history.replaceState(null, "", url);
+        setHandoffMismatch(true);
+        return;
+      }
+    }
+    if (expected) setHandoffOwner(expected);
+    if (url.searchParams.get("settings") === "account") {
+      setSettingsTab("account");
+      setOverlay("settings");
+      url.searchParams.delete("settings");
+      window.history.replaceState(null, "", url);
+    }
+    if (url.searchParams.get("topup") !== "credits") return;
+    setInitialTopUp(true);
+    setSettingsTab("usage");
+    setOverlay("settings");
+    // Settings retains the request through its existing sign-in gate.
+    url.searchParams.delete("topup");
+    window.history.replaceState(null, "", url);
+  }, [account, isReady, accountStatus]);
+  // Clear a consumed handoff before children render under a different owner.
+  if (
+    handoffOwner &&
+    account !== undefined &&
+    isReady !== false &&
+    accountStatus !== "loading" &&
+    account?.id !== handoffOwner
+  ) {
+    setHandoffOwner(null);
+    setInitialTopUp(false);
+    setOverlay("none");
+    setHandoffMismatch(true);
+  }
+  const [walletAccountMenu, setWalletAccountMenu] =
+    useState<WalletAccountMenuOptions>();
+  const openSettings = useCallback((tab: SettingsTab) => {
+    setSettingsTab(tab);
+    setOverlay("settings");
+  }, []);
+  // In-chat controls (the composer's safety menu) deep-link into Settings.
+  useSettingsOpenRequest(openSettings);
+  // `/?settings=<tab>` (from /settings/account) opens Settings once;
+  // `settings=policies&wallet=<id>&policy=<id>` opens it on that policy.
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const tab = url.searchParams.get("settings");
+    if (tab === null) return;
+    url.searchParams.delete("settings");
+    if (tab === "policies") {
+      const wallet = url.searchParams.get("wallet");
+      const policy = url.searchParams.get("policy") ?? undefined;
+      if (wallet) setPolicyFocus({ wallet, policy });
+      url.searchParams.delete("wallet");
+      url.searchParams.delete("policy");
+    }
+    window.history.replaceState(window.history.state, "", url);
+    if (SETTINGS_TABS.includes(tab as SettingsTab))
+      openSettings(tab as SettingsTab);
+  }, [openSettings]);
+  if (
+    account !== undefined &&
+    (!accountFrameScope.initialized ||
+      accountFrameScope.account?.kind !== account?.kind ||
+      accountFrameScope.account?.id !== account?.id)
+  ) {
+    setAccountFrameScope({
+      account,
+      initialized: true,
+      clearThreadUrl: accountFrameScope.account?.kind === "user",
+      // The runtime closes the old account's chats without remounting the
+      // shell. URL navigation still starts over for a new account.
+      revision:
+        accountFrameScope.revision + (accountFrameScope.initialized ? 1 : 0),
+    });
+  }
+
+  // The lazy wallet host reports booting before its account adapter exists.
+  // Its missing accountStatus must not validate a saved URL as disconnected.
+  const restoringSession = isReady === false || accountStatus === "loading";
+  const [threadUrlState, setThreadUrlState] = useState(() => ({
+    revision: accountFrameScope.revision,
+    navigation: createThreadUrlNavigation(),
+    clearThreadUrl: false,
+  }));
+  if (threadUrlState.revision !== accountFrameScope.revision) {
+    setThreadUrlState({
+      revision: accountFrameScope.revision,
+      navigation: createThreadUrlNavigation(),
+      clearThreadUrl: accountFrameScope.clearThreadUrl,
+    });
+  }
+  useLayoutEffect(() => {
+    if (!threadUrlState.clearThreadUrl) return;
+    // Account teardown already closed these chats. Do not restore their URL
+    // under the new guest or account and report an intentional reset as an error.
+    const url = new URL(window.location.href);
+    url.searchParams.delete("thread");
+    window.history.replaceState(null, "", url);
+    threadUrlState.navigation.navigate(null);
+  }, [threadUrlState]);
+  const urlNavigation = useSyncExternalStore(
+    threadUrlState.navigation.subscribe,
+    threadUrlState.navigation.getSnapshot,
+    threadUrlState.navigation.getSnapshot,
+  );
+
+  return (
+    <main
+      aria-busy={restoringSession}
+      data-testid="portal-shell"
+      className="bg-background relative h-full w-full overflow-hidden"
+    >
+      {handoffMismatch && (
+        <div
+          role="alert"
+          className="bg-background border-border absolute inset-x-4 top-4 z-50 rounded-xl border p-4 shadow-lg"
+        >
+          Your Aomi account changed while opening this page. Return to the
+          Fuzzer and choose an account again before adding credits.
+          <button
+            type="button"
+            className="ml-3 underline"
+            onClick={() => setHandoffMismatch(false)}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+      <div data-testid="portal-frame-content" className="h-full w-full">
+        <AomiFrame.Root
+          products={DEFAULT_SIDEBAR_PRODUCTS}
+          apiKeyPersistence="session"
+          width="100%"
+          height="100%"
+          backendUrl={backendUrl}
+          applicationId={lockedApplicationId}
+          displayPersistence="account"
+          agentTarget={
+            lockedTarget ? { mode: "direct", ...lockedTarget } : undefined
+          }
+          accountSessionAvailable={Boolean(account)}
+          // The host restores saved chats from the URL through ThreadUrlBootstrap.
+          // Without a thread URL, open the new-chat starting screen.
+          persistThread={false}
+          showSidebar
+          walletPosition="footer"
+          walletFamilies={["evm", "solana"]}
+          walletConnectLabel="Sign in"
+          walletAccountMenu={walletAccountMenu}
+          className="portal-aomi-frame aui-suggestions-marquee rounded-none border-0 shadow-none"
+          clientOptions={clientOptions}
+        >
+          <PortalFrameContents
+            navigation={threadUrlState.navigation}
+            ready={!restoringSession}
+            openSettings={openSettings}
+            onWalletAccountMenuChange={setWalletAccountMenu}
+          />
+          <AomiFrame.Header>
+            <PortalHeaderControls
+              onOpenSettings={() => openSettings("general")}
+              onOpenPackages={() => setOverlay("packages")}
+            />
+          </AomiFrame.Header>
+          <PortalComposer
+            lockedTarget={lockedTarget}
+            appTag={appTag}
+            // First Send joins the shared cookie preparation. A linked chat
+            // waits for its target so admission cannot create a different chat.
+            sendDisabled={
+              urlNavigation.navigating && Boolean(urlNavigation.requestedThread)
+            }
+            // Until the URL is read, or while its chat is confirmed, a reload
+            // shows nothing instead of flashing the new-chat screen.
+            opening={
+              urlNavigation.navigating && urlNavigation.requestedThread !== null
+            }
+          />
+          <SvmWalletBindingGate />
+          {/* Inside the frame so they see the Aomi runtime (the settings
+            account tab needs the live thread id); portalled to <body> so one
+            backdrop still covers the sidebar and chat as one surface. */}
+          {overlay === "settings" &&
+            (!handoffOwner ||
+              (!restoringSession && account?.id === handoffOwner)) && (
+              <OverlayPortal>
+                <SettingsModal
+                  key={settingsTab}
+                  initialTab={settingsTab}
+                  initialTopUp={initialTopUp}
+                  policyFocus={policyFocus}
+                  onClose={() => {
+                    setHandoffOwner(null);
+                    setInitialTopUp(false);
+                    setPolicyFocus(undefined);
+                    setOverlay("none");
+                  }}
+                />
+              </OverlayPortal>
+            )}
+          {overlay === "packages" && (
+            <OverlayPortal>
+              <PackagesModal onClose={() => setOverlay("none")} />
+            </OverlayPortal>
+          )}
+        </AomiFrame.Root>
+      </div>
+    </main>
+  );
+}

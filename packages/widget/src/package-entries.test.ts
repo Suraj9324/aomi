@@ -1,0 +1,39 @@
+// @vitest-environment node
+
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+
+// package-entries.json is the one list of entry points: tsup and the type
+// build read it, and both published manifests must match it.
+const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const read = (path: string) =>
+  JSON.parse(readFileSync(resolve(packageRoot, path), "utf8"));
+const { entries } = read("package-entries.json") as { entries: Record<string, string> };
+const stylesheets = {
+  "./design-tokens.css": { types: "./dist/styles.d.ts", default: "./design-tokens.css" },
+  "./styles.css": {
+    types: "./dist/styles.d.ts",
+    default: "./dist/styles.css",
+  },
+};
+const expectedExports = Object.fromEntries([
+  ...Object.keys(entries).map((entry) => [
+    entry === "index" ? "." : `./${entry}`,
+    { types: `./dist/${entry}.d.ts`, import: `./dist/${entry}.js` },
+  ]),
+  ...Object.entries(stylesheets),
+]);
+
+describe("package entry points", () => {
+  it("maps every entry to an existing source module", () => {
+    for (const source of Object.values(entries))
+      expect(existsSync(resolve(packageRoot, source)), source).toBe(true);
+  });
+
+  it("publishes exactly the listed entries from @aomi-labs/widget", () => {
+    expect(read("package.json").exports).toEqual(expectedExports);
+  });
+
+});

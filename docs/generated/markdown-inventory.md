@@ -1,0 +1,142 @@
+---
+owner: platform
+status: authoritative
+area: markdown-inventory
+sources_of_truth:
+  - repowiki.toml
+review_after_days: 7
+---
+
+# Markdown Inventory
+
+- Indexed markdown files: 26
+- Excluded markdown files: 96
+
+## Reasons
+- `indexed`: 26
+- `not-included`: 96
+
+## Indexed Files
+- `AGENTS.md` via `root-guidance`
+- `README.md` via `root-readme`
+- `docs/generated/markdown-inventory.md` via `generated`
+- `docs/generated/repo-inventory.md` via `generated`
+- `docs/index.md` via `docs-index`
+- `docs/topics/apps/facts/app-surfaces.md` via `topics`
+- `docs/topics/apps/facts/widget-frame.md` via `topics`
+- `docs/topics/apps/facts/working-trace.md` via `topics`
+- `docs/topics/auth/facts/auth.md` via `topics`
+- `docs/topics/auth/facts/base-account.md` via `topics`
+- `docs/topics/auth/facts/wallet-kit.md` via `topics`
+- `docs/topics/bff/facts/endpoints.md` via `topics`
+- `docs/topics/client-runtime/facts/chat-controls.md` via `topics`
+- `docs/topics/client-runtime/facts/cli.md` via `topics`
+- `docs/topics/client-runtime/facts/react-runtime.md` via `topics`
+- `docs/topics/client-runtime/facts/solana-transactions.md` via `topics`
+- `docs/topics/client-runtime/facts/transport-client.md` via `topics`
+- `docs/topics/deploy/facts/projects.md` via `topics`
+- `docs/topics/development/facts/frontend-invariants.md` via `topics`
+- `docs/topics/development/facts/transaction-safety.md` via `topics`
+- `docs/topics/development/facts/workspace.md` via `topics`
+- `docs/topics/index.md` via `topics-index`
+- `specs/DEMO-SCENARIOS.md` via `specs`
+- `specs/DEMO-STUDIO.md` via `specs`
+- `specs/DOMAIN.md` via `specs`
+- `specs/METADATA.md` via `specs`
+
+## Excluded Files
+- `.agents/skills/repowiki.md` (not-included)
+- `.changeset/account-svm-commit-routes.md` (not-included)
+- `.changeset/chatrc-refusal-and-scroll.md` (not-included)
+- `.changeset/lane-safety-rename.md` (not-included)
+- `.changeset/policy-deslop.md` (not-included)
+- `.changeset/portal-aiqa-fixes.md` (not-included)
+- `.changeset/sign-page-batch-cards.md` (not-included)
+- `.changeset/solana-commits.md` (not-included)
+- `.changeset/solana-sign-in.md` (not-included)
+- `.changeset/staging-chat-host.md` (not-included)
+- `.changeset/trace-no-failed-count.md` (not-included)
+- `CLAUDE.md` (not-included)
+- `STATE.md` (not-included)
+- `api-reports/aomi-labs-client-browser-auth.api.md` (not-included)
+- `api-reports/aomi-labs-client-main.api.md` (not-included)
+- `api-reports/aomi-labs-client-node.api.md` (not-included)
+- `api-reports/aomi-labs-client-solana.api.md` (not-included)
+- `api-reports/aomi-labs-client-trace.api.md` (not-included)
+- `api-reports/aomi-labs-client-viem.api.md` (not-included)
+- `api-reports/aomi-labs-react-main.api.md` (not-included)
+- `api-reports/aomi-labs-widget-browser-auth.api.md` (not-included)
+- `api-reports/aomi-labs-widget-checkout.api.md` (not-included)
+- `api-reports/aomi-labs-widget-control-bar.api.md` (not-included)
+- `api-reports/aomi-labs-widget-frame.api.md` (not-included)
+- `api-reports/aomi-labs-widget-host-composition.api.md` (not-included)
+- `api-reports/aomi-labs-widget-main.api.md` (not-included)
+- `api-reports/aomi-labs-widget-providers-para.api.md` (not-included)
+- `api-reports/aomi-labs-widget-providers-privy.api.md` (not-included)
+- `api-reports/aomi-labs-widget-styles.css.api.md` (not-included)
+- `apps/edge/README.md` (not-included)
+- `apps/landing/README.md` (not-included)
+- `apps/landing/content/agents/SKILLS-SOURCE.md` (not-included)
+- `apps/landing/content/agents/agents.md` (not-included)
+- `apps/landing/content/agents/faq.md` (not-included)
+- `apps/landing/content/agents/skills/aomi-build/SKILL.md` (not-included)
+- `apps/landing/content/agents/skills/aomi-build/references/aomi-sdk-patterns.md` (not-included)
+- `apps/landing/content/agents/skills/aomi-build/references/spec-to-tools.md` (not-included)
+- `apps/landing/content/agents/skills/aomi-transact/SKILL.md` (not-included)
+- `apps/landing/content/agents/skills/aomi-transact/references/account-abstraction.md` (not-included)
+- `apps/landing/content/agents/skills/aomi-transact/references/apps.md` (not-included)
+- `apps/landing/content/agents/skills/aomi-transact/references/commands.md` (not-included)
+- `apps/landing/content/agents/skills/aomi-transact/references/drain-vectors.md` (not-included)
+- `apps/landing/content/agents/skills/aomi-transact/references/examples.md` (not-included)
+- `apps/landing/content/agents/skills/aomi-transact/references/gotchas.md` (not-included)
+- `apps/landing/content/agents/skills/aomi-transact/references/session.md` (not-included)
+- `apps/landing/content/agents/skills/aomi-transact/references/troubleshooting.md` (not-included)
+- `apps/landing/content/agents/skills/aomi-transact/references/workflows.md` (not-included)
+- `apps/landing/content/research/aomibench-v0.1.md` (not-included)
+- `apps/landing/content/research/auth-across-two-worlds.md` (not-included)
+- `apps/landing/content/research/introducing-the-agentic-fuzzer.md` (not-included)
+- `apps/landing/content/research/introducing-the-aomi-task-api.md` (not-included)
+- `apps/landing/content/research/three-gates-onchain.md` (not-included)
+- `apps/landing/public/research/aomibench-v0.1/aombench_v1_data/MANIFEST.md` (not-included)
+- `apps/landing/public/research/aomibench-v0.1/aombench_v1_data/README.md` (not-included)
+- `apps/landing/src/features/marketing/HOME.md` (not-included)
+- `apps/landing/src/server/assets/README.md` (not-included)
+- `apps/portal/README.md` (not-included)
+- `demo/MCP_CLI_SIGNING_DEMO.md` (not-included)
+- `demo/README.md` (not-included)
+- `docs/decisions.md` (not-included)
+- `docs/topics/security/official-install-paths.md` (not-included)
+- `docs/trace-attribution/README.md` (not-included)
+- `examples/embed-next/README.md` (not-included)
+- `examples/embed-vite/README.md` (not-included)
+- `examples/headless/README.md` (not-included)
+- `examples/web-sign/README.md` (not-included)
+- `infra/build-runner/README.md` (not-included)
+- `packages/account/CHANGELOG.md` (not-included)
+- `packages/app-kit/fonts/README.md` (not-included)
+- `packages/cli/CHANGELOG.md` (not-included)
+- `packages/cli/README.md` (not-included)
+- `packages/client/CHANGELOG.md` (not-included)
+- `packages/client/README.md` (not-included)
+- `packages/client/skills/repowiki/SKILL.md` (not-included)
+- `packages/client/src/trace/protocols/README.md` (not-included)
+- `packages/deploy/CHANGELOG.md` (not-included)
+- `packages/deploy/README.md` (not-included)
+- `packages/deploy/skills/aomi-deploy/SKILL.md` (not-included)
+- `packages/internal/README.md` (not-included)
+- `packages/react/CHANGELOG.md` (not-included)
+- `packages/react/README.md` (not-included)
+- `packages/service-identity/CHANGELOG.md` (not-included)
+- `packages/service-identity/README.md` (not-included)
+- `packages/smither/CHANGELOG.md` (not-included)
+- `packages/smither/README.md` (not-included)
+- `packages/widget/CHANGELOG.md` (not-included)
+- `packages/widget/README.md` (not-included)
+- `packages/widget/e2e/checkout/README.md` (not-included)
+- `packages/widget/src/icons/apps/SOURCES.md` (not-included)
+- `packages/widget/src/icons/skills/SOURCES.md` (not-included)
+- `packages/widget/src/icons/skills/assets/README.md` (not-included)
+- `packages/widget/src/icons/skills/assets/WEB3-ICONS-NOTICE.md` (not-included)
+- `tests/contracts/README.md` (not-included)
+- `tests/e2e/README.md` (not-included)
+- `tests/fixtures/account-merge/README.md` (not-included)
